@@ -1,0 +1,173 @@
+# ZhiShi 专家知识导入 — .NET 0day 挖掘 SOP（源自 dotnet-go 近一年 CVE 分析）
+# 用法：zhishi expert import expert-import.dotnet-0day.yaml --reviewer j0hnexp
+# domain 统一 whitebox（使用场景：代码级 0day 挖掘，域错会被检索过滤）。
+# 证据：CVE 引用已对 OSV(api.osv.dev) 核实、源码路径已对 GitHub master 核实(2026-08-23)；评级(9.9/9.1/9.8)出自内部 xlsx 重点漏洞表，上报前以 NVD/MSRC 复核。
+# 注意：导入不去重，同一文件只导一次；重复了用 zhishi expert rm 清理。
+
+- title: .NET 0day 挖掘选题优先级——认证边界与反序列化优先
+  kind: idea
+  domain: whitebox
+  applicability: 开始一轮 .NET 0day 挖掘、需要决定先打哪个组件时
+  content: |
+    优先级按「历史漏洞量 × 跨 bug 家族数 × 已知严重度」叠加排序：
+    T0 Kestrel/ASP.NET Core 认证边界（9.9 请求走私 + 9.1 签名绕过）与
+    System.Formats.Nrbf 反序列化（9.8 类型混淆 RCE）；
+    T1 .NET SDK/NuGet/MSBuild 供应链；T2 Runtime/WPF/MAUI（面大单点收益略低）。
+    家族取舍：RCE(14.5%) 与认证绕过(12.4%) 单条价值最高优先挖；
+    DoS(41%) 只做组合拳。凡触碰 Passkey/OpenAPI 3.1/SSE/防开放重定向的
+    新特性都直接改写认证边界，优先审 diff。
+    评级出处：内部 xlsx 重点漏洞表，上报前以 NVD/MSRC 复核。
+  criteria: 组件同时满足「历史漏洞量大、跨多 bug 家族、出过 ≥9.0」才进 T0；仅 DoS 历史且无认证面的组件降级。
+  tags: dotnet, 0day, target-selection
+  reviewer: j0hnexp
+
+- title: Kestrel 与 ASP.NET Core 认证边界挖掘流程（T0）
+  kind: sop
+  domain: whitebox
+  applicability: 挖 .NET HTTP 服务端 0day，重点 Kestrel 解析与认证中间件
+  content: |
+    1. 锁源码：dotnet/aspnetcore 的 src/Servers/Kestrel（Core/Http、
+       Http2/Http3 帧处理）、src/Security/Authentication（Handler、
+       Challenge/Forbid 流程）、src/Middleware、src/Http/Http/src/Headers
+       （src/Servers 下 HttpSys、IIS 为同边界姊妹实现，已核实存在）；
+    2. 三类模式：CL/TE 双写与 H2 伪头混用的请求走私、returnUrl/开放重定向/
+       scheme 切换的认证绕过、[Authorize] 与匿名端点路由优先级；
+    3. Fuzz：畸形 HTTP/1.1+HTTP/2 混合请求打 Kestrel；Header 字符级变异
+       （NUL、CR 注入、超长行）；
+    4. 验证：对拍脚本确认「前端 1 个请求/后端 2 个」或鉴权上下文被伪造；
+    5. 定级：绕过后端鉴权或解析层分歧即走私/认证绕过，默认 ≥9.0。
+  criteria: 能把请求绕过后端鉴权、或在一个解析层被当作两个请求即成立；仅 4xx 行为差异不算。
+  tags: dotnet, kestrel, smuggling, auth-bypass, 0day
+  reviewer: j0hnexp
+
+- title: .NET 请求走私对拍验证法
+  kind: technique
+  domain: whitebox
+  applicability: 怀疑 Kestrel 或前置代理存在走私、需要坐实时
+  content: |
+    构造 CL/TE、TE/CL、H2 伪头（:authority 与 Host 不一致）三组对拍请求，
+    对比前端与 Kestrel 的路由命中、X-Forwarded 差异、响应时序。
+    判走私的关键是「一个字节流两种解析」：前端认为结束而后端继续读，或反之。
+    注意 Kestrel 对 Content-Length+Transfer-Encoding 共存的默认拒绝行为，
+    要找的是绕过该拒绝的路径（畸形 TE 值、obs-fold、H2 降级）。
+  criteria: 前后端对同一字节流的请求边界认定不一致，且能 smuggle 第二个请求即成立。
+  tags: dotnet, request-smuggling, 0day
+  reviewer: j0hnexp
+
+- title: System.Formats.Nrbf 反序列化挖掘流程（T0）
+  kind: sop
+  domain: whitebox
+  applicability: 挖 .NET 反序列化 0day，重点 NrbfReader 与 BinaryFormatter 遗留路径
+  content: |
+    1. 锁源码：dotnet/runtime 的 src/libraries/System.Formats.Nrbf
+       （NrbfReader、TypeName 解析）与 System.Runtime.Serialization.Formatters
+       桥接点、任何仍调用 Deserialize 的路径；
+    2. 三类模式：攻击者控制 BinaryType/AssemblyName 使读取器实例化非预期类型
+       （类型混淆）、ISerializable 构造期触发的 gadget 链、
+       memberCount/嵌套深度整数问题致越界读；
+    3. Fuzz：结构感知变异 .nrbf 字节流，重点打 TypeName 字符串、memberCount、
+       嵌套深度；
+    4. 验证：最小 .nrbf 打到 poc 端点，监控 Process.Start/文件写；
+    5. 定级：能实例化任意类型或触发非预期代码路径即 RCE（历史 9.8，默认 ≥9.0）。
+  criteria: 反序列化过程实例化攻击者指定的非预期类型即成立；仅越界读无类型混淆的降级处理。
+  tags: dotnet, nrbf, deserialization, rce, 0day
+  reviewer: j0hnexp
+
+- title: Nrbf 类型混淆判定要点
+  kind: technique
+  domain: whitebox
+  applicability: 审计 Nrbf/二进制序列化读取器的类型解析逻辑时
+  content: |
+    类型混淆的核心是「流里声明的类型」与「实际构造的类型」出现分歧。
+    检查三点：TypeName 解析是否完整校验程序集名与泛型参数；
+    记录类型（ClassRecord/ArrayRecord）与成员布局是否可被 memberCount
+    操纵错位；跨记录引用（MemberReference）的 id 是否可指向非预期记录。
+    gadget 方向：任何 ISerializable 实现在反序列化构造期执行的字段依赖逻辑。
+  criteria: 构造的 .nrbf 能让运行期类型与流声明类型不一致即类型混淆成立。
+  tags: dotnet, type-confusion, gadget, 0day
+  reviewer: j0hnexp
+
+- title: .NET SDK 与 NuGet/MSBuild 供应链挖掘流程（T1）
+  kind: sop
+  domain: whitebox
+  applicability: 挖 .NET 构建链供应链 0day（restore/build 阶段代码执行）
+  content: |
+    1. 锁源码：NuGet.Client（Commands/Resolver）、dotnet/msbuild 的
+       Task 加载与 UsingTask 解析、包签名校验、restore 脚本执行点；
+    2. 三类模式：NuGet 客户端 RCE（CVE-2023-29337 = GHSA-6qmf-mmc7-6c2p，
+       官方仅标题级描述，机理须查 MSRC 原文，勿预设为 init.ps1 路径）、
+       包内 init.ps1/MSBuild Task 在还原/构建期的执行能力（NuGet 既定行为面，
+       供应链武器化经典入口，与上述 CVE 分开评估）、包源中间人/代理信任绕过、
+       签名校验绕过；
+    3. 验证：离线沙箱自建恶意包源，观察 dotnet restore / nuget restore
+       是否拉起 init.ps1 或自定义 Task；
+    4. 定级：借 restore/build 在受害者机器执行代码即供应链 RCE ≥8.8。
+  criteria: 默认配置下 restore 或 build 阶段执行包内代码即成立；需要受害者手动改配置的不算。
+  tags: dotnet, nuget, msbuild, supply-chain, 0day
+  reviewer: j0hnexp
+
+- title: .NET Runtime 与 WPF/MAUI 审计流程（T2）
+  kind: sop
+  domain: whitebox
+  applicability: .NET T0/T1 面打完后的横向扩展（面最广，26 CVE、6 类）
+  content: |
+    1. 锁源码：coreclr（JIT/GC/加载器、System.Private.CoreLib 边界）、
+       libraries 的 System.Text.Json/System.Xml/System.Drawing、
+       WPF 在独立仓库 dotnet/wpf（src/Microsoft.DotNet.Wpf，已核实）的 XAML
+       解析与资源加载（2026 RCE 集中区）、MAUI 在 dotnet/maui（原生互操作）；
+    2. 三类模式：DLL 劫持与加载搜索顺序、XAML 外部实体/资源加载、
+       解析器深度递归与类型转换器代码路径；
+    3. Fuzz：对 JsonDocument/XML 等纯解析器做结构变异，
+       托管侧用 AFL++/libFuzzer 绑定最有效；
+    4. 定级：WPF 重点找 XAML 到代码执行；Runtime 找解析器 RCE/EoP。
+  criteria: XAML/解析路径能触达非预期代码执行或越界即成立；纯 DoS 按 T2 低优先级批量处理。
+  tags: dotnet, runtime, wpf, xaml, 0day
+  reviewer: j0hnexp
+
+- title: .NET 0day 挖掘误报排除清单
+  kind: idea
+  domain: whitebox
+  applicability: .NET 漏洞复现后、上报前的去伪阶段
+  content: |
+    先排除三类：1) 仅在启用开发/调试开关下触发的路径（非默认面）；
+    2) 需要受害者主动打开不可信文件且 UAC/沙箱已拦截的组合；
+    3) 纯 DoS 单条（除非能升级为 RCE/EoP）。
+    另：所有还原/构建类测试在离线沙箱跑；提交用最小 PoC，
+    不附带可利用完整武器化代码；上报前 git log + GitHub Advisory + NVD
+    查同面近期 fix，同函数/同解析层变体算同一根因。
+  criteria: 默认配置、无需开发开关、无沙箱拦截的可复现路径才算有效 0day 面。
+  tags: dotnet, false-positive, opsec, 0day
+  reviewer: j0hnexp
+
+- title: 0day 立场——已知 CVE 是模式种子不是复现目标（.NET）
+  kind: idea
+  domain: whitebox
+  applicability: 用本组 .NET 知识开始挖掘前的定位校准，防止滑向复现已知漏洞
+  content: |
+    本库引用的 CVE 与评级（9.9/9.8 等，出自内部 xlsx）都是「边界出过严重
+    bug」的证据，用途是选面与校准识别，不是复现清单。0day 三个真实来源：
+    1) 不完整修复——Patch Tuesday 只堵主路径，姊妹实现/其他协议分支仍在；
+    2) 同根因变体——CL/TE 歧义、类型混淆等根因换入口重演；
+    3) 新代码——新认证/OpenAPI/Passkey 等特性代码没有历史审计积累。
+    立场检查：产出是「旧版本跑通已修复 CVE 的 PoC」= 回归测试，不是 0day。
+  criteria: 发现能在当前最新 release 上触发、且 MSRC/GitHub Advisory/NVD 查无对应实例的，才是 0day 产出。
+  tags: dotnet, methodology, 0day
+  reviewer: j0hnexp
+
+- title: 不完整修复与变体二轮挖掘法（.NET）
+  kind: technique
+  domain: whitebox
+  applicability: 对任一已知 .NET 安全修复（Patch Tuesday）做第二轮挖掘（0day 产出率最高路径）
+  content: |
+    以官方修复为起点做三问：
+    1) 修复覆盖了吗——.NET 同一安全逻辑常有多实现：Kestrel 修复后问
+       HttpSys/IIS 姊妹实现（src/Servers 下并列，已核实存在）是否共享修复；
+       HTTP/1.1 修复后问 HTTP/2、HTTP/3(MSQuic/QUIC) 分支是否同改；
+    2) 修复本身可绕吗——限值/拒绝类修复问叠加与编码：单请求不触发、
+       并发或分片是否可绕；拒绝逻辑基于的字段是否攻击者可控；
+    3) 新代码优先——用安全相关 churn 排序新攻击面（内部 xlsx 统计近一年
+       runtime 219 条、aspnetcore 149 条安全相关变更），新增认证/重定向/
+       OpenAPI 代码是 0day 概率最高的区域。
+  criteria: 在最新 release 上构造出官方修复未覆盖的同类触发路径即产出；仅在被修复版本复现原 CVE 不算。
+  tags: dotnet, fix-bypass, variant, 0day
+  reviewer: j0hnexp

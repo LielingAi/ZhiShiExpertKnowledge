@@ -1,0 +1,191 @@
+# ZhiShi 专家知识导入 — Go 0day 挖掘 SOP（源自 dotnet-go 近一年 CVE 分析）
+# 用法：zhishi expert import expert-import.go-0day.yaml --reviewer j0hnexp
+# domain 统一 whitebox（使用场景：代码级 0day 挖掘，域错会被检索过滤）。reviewer 可被 --reviewer 覆盖。
+# 证据：CVE 机理已对 OSV(api.osv.dev)、源码路径已对 GitHub master 逐一核实(2026-08-23)，证据 JSON 在 osv/ 目录。
+# 注意：导入不去重，同一文件只导一次；重复了用 zhishi expert rm 清理。
+
+- title: Go 0day 挖掘选题优先级——工具链优先于标准库
+  kind: idea
+  domain: whitebox
+  applicability: 开始一轮 Go 0day 挖掘、需要决定先打哪个模块时
+  content: |
+    优先级按「历史漏洞量 × 跨 bug 家族数 × 已知严重度」叠加排序：
+    T0 cmd/go 工具链（7 RCE + 6 认证绕过，CVSS 9.8 频出的供应链面）；
+    T1 net/http、crypto/tls、x/crypto/ssh（解析器+密码学+协议边界）。
+    家族取舍：RCE 与认证绕过单条价值最高优先挖；DoS 数量多但只做组合拳。
+    判分参考：CVE数×0.3 + bug类数×2 + 严重数×3，仅用于横向排序。
+    评级出处：内部 CVE 库（xlsx），上报前以 NVD/MSRC 复核；CVE 机理均已对 OSV 核实。
+  criteria: 模块同时满足「历史漏洞量大、跨多 bug 家族、出过 ≥9.0」才进 T0；无历史严重 CVE 且单一 bug 类的模块降级或放弃。
+  tags: go, 0day, target-selection
+  reviewer: j0hnexp
+
+- title: Go cmd/go 工具链供应链挖掘流程（T0）
+  kind: sop
+  domain: whitebox
+  applicability: 对 golang/go 的 cmd/go 做源码审计，目标供应链 RCE（CVSS 9.8 面）
+  content: |
+    1. 锁版本：git checkout go<target>，进 src 跑 ./all.bash 确认可构建；
+    2. 审四个入口：internal/modload（go.mod/go.sum 解析）与 internal/toolchain（toolchain 切换，已核实存在）、
+       internal/work（构建与 //go:* 指令）、internal/vcs（VCS 检出与凭证）、
+       internal/cfg 与 proxy.go（代理与 sumdb 信任）；
+    3. 重点打四类模式：toolchain 指令执行、cgo 指令绕过、VCS 凭证泄露、代理信任绕过；
+    4. 动态验证：离线沙箱内自建 GOPROXY + 恶意模块，观察 go build / go get
+       是否触发命令执行；模块路径注入换行/控制字符/特殊目录名；
+    5. 定级：能在构建/拉取阶段执行任意命令即供应链 RCE，默认 ≥9.0 上报。
+  criteria: go build 或 go get 阶段在受害者机器执行任意命令即成立；仅在 GOFLAGS=-insecure 等非默认开关下触发的路径不算。
+  tags: go, supply-chain, cmd/go, rce, 0day
+  reviewer: j0hnexp
+
+- title: go.mod toolchain 指令执行挖掘（CVE-2023-39320 类）
+  kind: technique
+  domain: whitebox
+  applicability: 审计 cmd/go 的 go.mod 解析与 toolchain 切换逻辑时
+  content: |
+    go.mod 的 toolchain 指令可诱导 go 命令执行模块内相对路径的脚本或二进制。
+    挖法：沿 modload 里 toolchain 伪版本解析 → 版本切换 → 子进程调用的链路，
+    找「未限定绝对路径/未校验来源就 exec」的点；再用畸形 toolchain 值
+    （相对路径、@版本修饰、换行注入）构造恶意 go.mod 做动态确认。
+    依据：CVE-2023-39320 = GO-2023-2042（官方确认 toolchain 指令可执行模块内相对脚本/二进制；Go 1.21 引入；代理拉取与 VCS 直取模块均适用）。
+  criteria: 恶意 go.mod 能让 go 命令执行模块内非预期文件即成立；仅打印信息或构建失败不成立。
+  tags: go, cmd/go, toolchain, rce, 0day
+  reviewer: j0hnexp
+
+- title: //line 行指令绕过 //go:cgo_ 限制（CVE-2023-39323 类）
+  kind: technique
+  domain: whitebox
+  applicability: 审计 cmd/go 对 //go:cgo_* 指令与编译器/链接器 flag 的限制逻辑时
+  content: |
+    //line 行指令可重写后续行的归属位置，历史上被用来绕过对 //go:cgo_ 指令的
+    限制，把被禁的链接器/编译器 flag 传进编译期。挖法：找所有基于
+    「行号/文件名」做安全判断的位置（flag 白名单、指令过滤），问一句：
+    //line 能不能把这个判断挪到攻击者控制的文件上。同类：cgo 构建期生成意外
+    代码（CVE-2023-29402 = GO-2023-1839，目录名带换行注入；官方明确仅影响
+    GOPATH 模式 GO111MODULE=off，go get 拉取的模块不受影响）。
+    难度提示（官方原文）：//line 需给出指令所在文件的绝对路径，利用复杂度显著更高。
+    依据：CVE-2023-39323 = GO-2023-2095。
+  criteria: 构造带 //line 的源文件能让被禁 flag/指令通过编译期检查即成立。
+  tags: go, cgo, compiler, bypass, 0day
+  reviewer: j0hnexp
+
+- title: Go net/http 协议边界挖掘流程（T1）
+  kind: sop
+  domain: whitebox
+  applicability: 挖 Go HTTP 服务端/客户端 0day，重点 HTTP/2 与 HTTP/1.1 边界
+  content: |
+    1. 锁源码三处：net/http（request/transfer/cookie）、
+       internal/http2（frame/server/continuation）、
+       internal/httpcommon（共享头解析）；
+    2. 三类模式：CONTINUATION 帧洪泛（单连接读任意量头部）、
+       CL/TE 双写与 H2 伪头混用导致的请求走私、新 CSRF 防护边界；
+    3. Fuzz：go test -fuzz 打头解析；协议侧自写客户端做帧结构变异（类型/长度/flag）；
+    4. 验证：单连接发超量 CONTINUATION，pprof 监控服务端 goroutine/内存；
+       混合 CL/TE 请求对拍前后端解析差异；
+    5. 定级：前后端解析分歧=走私 ≥9.0；单连接资源耗尽=DoS ≥7.5。
+  criteria: 前端解析为 1 个请求而后端解析为 2 个即走私成立；仅压满 CPU 但无解析分歧的降为 DoS。
+  tags: go, http2, smuggling, dos, 0day
+  reviewer: j0hnexp
+
+- title: HTTP/2 CONTINUATION 洪泛判定（CVE-2023-45288 类）
+  kind: technique
+  domain: whitebox
+  applicability: 评估 Go HTTP/2 端点对头部洪泛的暴露度时
+  content: |
+    攻击者发送过量 CONTINUATION 帧使端点读取任意量头部：维护 HPACK 状态
+    要求解析连接上全部 HEADERS/CONTINUATION 帧。关键机制（官方原文）：
+    头部超过 MaxHeaderBytes 后超出头部分不再分配内存存储、但仍被解析
+    ——所以判定看 CPU/解析耗时而非内存；Huffman 编码数据可显著放大成本。
+    MaxConcurrentStreams 管不住同一 stream 内的 CONTINUATION 序列，单流即成立。
+    依据：CVE-2023-45288 = GO-2024-2687 / GHSA-4v7x-pqxf-cx7m。
+  criteria: 单连接发送未终止的 CONTINUATION 序列使服务端解析时间无界增长即成立；仅看内存不可靠（超出 MaxHeaderBytes 的头不分配内存但仍被解析）。
+  tags: go, http2, continuation, dos, 0day
+  reviewer: j0hnexp
+
+- title: Go crypto/tls 时序与证书校验挖掘（T1）
+  kind: sop
+  domain: whitebox
+  applicability: 挖 Go TLS 栈 0day（侧信道/证书校验/握手错误处理）
+  content: |
+    1. 锁源码：crypto/tls（handshake_*/cipher_suites/common）、
+       crypto/rsa、math/big（大数运算恒定时序）；
+    2. 三类模式：非恒定时间运算的时序侧信道（RSA 密钥交换，CVE-2023-45287 类）、
+       超大 RSA 密钥耗尽 CPU（CVE-2023-29409 类）、握手失败错误回显攻击者
+       可控信息（ALPN，CVE-2025-58189 类）；
+    3. 验证：计时统计对比不同密钥/输入的握手耗时确认时序差；构造失败 ALPN
+       与超大证书链看错误信息与资源消耗；
+    4. 定级：时序差可泄露密钥材料 ≥5.9；错误回显泄露可控信息为信息泄露。
+    依据：CVE-2023-45287 = GO-2023-2375（限 Go<1.20，PKCS#1 去填充时序泄露可恢复会话密钥位，1.20 起换恒定时间实现）；CVE-2023-29409 = GO-2023-1987（修复=握手 RSA 密钥限 ≤8192 位）；CVE-2025-58189 = GO-2025-4008。
+  criteria: 能用统计计时区分密钥位即侧信道成立；仅消耗 CPU 无信息泄露降为 DoS。
+  tags: go, tls, side-channel, 0day
+  reviewer: j0hnexp
+
+- title: Go x/crypto/ssh 握手面挖掘（T1）
+  kind: sop
+  domain: whitebox
+  applicability: 挖 Go SSH 实现的认证绕过或握手 DoS
+  content: |
+    1. 锁源码：x/crypto/ssh 的 transport/handshake/server/client；
+    2. 三类模式：terrapin 前缀截断（BPP 握手阶段/序列号处理不当致扩展协商
+       报文被删、安全特性被降级，CVE-2023-48795 = GO-2023-2402）、慢速/不完成
+       KEX 致待传内容读入内存不发送（CVE-2025-22869 = GO-2025-3487，官方明确
+       限实现文件传输协议的 SSH 服务端/SFTP）、PublicKeyCallback 误用致授权绕过
+       （CVE-2024-45337 = GO-2024-3321：SSH 协议允许客户端先询问 key 是否可接受、
+       再证明持有私钥，callback 在未证明阶段即被调用且可带多个 key——把「可接受」
+       当「已认证」的应用可被绕过；修复 golang/crypto@b4f1988）；
+    3. 验证：写慢速 KEX 客户端观察服务端内存；畸形扩展协商包测完整性边界；
+       审计所有用 PublicKeyCallback 的应用是否在客户端证明持有私钥前就做出授权决定；
+    4. 定级：可注入/截断已认证通道 ≥7.5；单连接内存耗尽 DoS ≥7.5。
+  criteria: 能在握手后注入或截断已认证数据即认证绕过成立；回调误用类需给出可被绕过的具体配置。
+  tags: go, ssh, terrapin, auth-bypass, 0day
+  reviewer: j0hnexp
+
+- title: Go 0day 挖掘误报排除清单
+  kind: idea
+  domain: whitebox
+  applicability: Go 漏洞复现后、上报前的去伪阶段
+  content: |
+    先排除三类：1) 仅在 GOFLAGS=-insecure、显式关闭 sumdb 等非默认开关下触发；
+    2) 纯 DoS 且无法升级为 RCE/EoP 的单条（批量低优先级处理）；
+    3) 需要受害者主动 go get 不可信模块且已被其他机制拦截的组合。
+    另：所有还原/构建类测试必须在离线沙箱，防误触发真实供应链写盘；
+    提交只用最小 PoC，不附带武器化代码；上报前查 git log、
+    golang/go security advisories、NVD，同函数/同解析层变体算同一根因。
+  criteria: 默认配置、默认开关下可复现且无前置信任条件才算有效 0day 面。
+  tags: go, false-positive, opsec, 0day
+  reviewer: j0hnexp
+
+- title: 0day 立场——已知 CVE 是模式种子不是复现目标
+  kind: idea
+  domain: whitebox
+  applicability: 用本组 Go 知识开始挖掘前的定位校准，防止滑向复现已知漏洞
+  content: |
+    本库引用的全部 CVE（含依据行里的 GO-ID/GHSA-ID）都是「根因模式种子」：
+    用来校准你对该类 bug 的识别能力，然后去挖未修复的同类新实例。
+    0day 的三个真实来源：
+    1) 不完整修复——官方修复 commit 常只堵触发主路径，旁路/姊妹入口仍在；
+    2) 同根因变体——换 frame、换指令、换调用点，根因不变；
+    3) 新代码——新特性/重构引入的新攻击面（历史审计从未覆盖）。
+    立场检查：如果一项工作的产出是「在旧版本上跑通已修复 CVE 的 PoC」，
+    那是回归测试，不是 0day 挖掘。
+  criteria: 发现能在当前最新 release 上触发、且官方 advisory/NVD 查无对应实例的，才是 0day 产出；只能复现已修复 CVE 的不算。
+  tags: go, methodology, 0day
+  reviewer: j0hnexp
+
+- title: 不完整修复与变体二轮挖掘法（Go）
+  kind: technique
+  domain: whitebox
+  applicability: 对任一已知 Go 安全修复做第二轮挖掘（0day 产出率最高的路径）
+  content: |
+    以修复 commit 为起点做三问：
+    1) 修复覆盖了吗——检查同一解析器/同一校验的其他入口是否仍可达。
+       例：CONTINUATION 修复（GO-2024-2687）后，问 HPACK/头解析里还有
+       哪些「解析无上界但存储有上界」的循环没有上界检查；
+    2) 修复本身可绕吗——限值类修复问叠加与编码：如握手 RSA ≤8192 位
+       （GO-2023-1987）修复后，多条不超限证书链叠加、非 RSA 套件的
+       大参数握手是否仍可耗尽 CPU；
+    3) 同根因扩散——从根因出发而非从 CVE 出发扫姊妹代码：
+       //line 根因=「基于行号/文件名的安全判断可被重定位」→ 扫所有
+       //go: 指令校验点；toolchain 根因=「go.mod 指令可触发子进程」→
+       扫 go.mod/go.sum 解析触发的全部执行点。
+  criteria: 在最新 release 上构造出官方修复未覆盖的同类触发路径即产出；仅在被修复版本复现原 CVE 不算。
+  tags: go, fix-bypass, variant, 0day
+  reviewer: j0hnexp
