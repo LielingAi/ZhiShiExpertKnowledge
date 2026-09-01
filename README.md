@@ -13,6 +13,10 @@
 
 ## 导入用法
 
+两种方式：CLI 或 GUI 设置页。
+
+### CLI
+
 需要 ZhiShi ≥ 1.2.10（`zhishi expert import` 通道）：
 
 ```bash
@@ -22,7 +26,11 @@ zhishi expert import expert-import-dotnet-0day.yaml --reviewer j0hnexp
 
 `reviewer` 取值顺序：条目字段 → `--reviewer` 参数兜底 → 都没有则该条拒绝导入。
 
-导入后：
+### GUI
+
+主窗口 设置 → 「专家知识」页签 → 「导入 JSON/YAML」（1.3.1 起）：选择文件（`.json` / `.yaml` / `.yml`，单条或数组）或直接粘贴内容，逐条校验后入库。GUI 通道的 `reviewer` 写在条目里（本仓库文件每条已自带）。
+
+导入后（两种方式通用）：
 
 ```bash
 zhishi expert list                 # 专家库清单
