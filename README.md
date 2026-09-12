@@ -8,8 +8,11 @@
 | --- | --- | --- |
 | `expert-import-go-0day.yaml` | Go 0day 挖掘：cmd/go 工具链供应链、net/http 协议边界（HTTP/2 CONTINUATION 洪泛、请求走私）、crypto/tls 时序侧信道、x/crypto/ssh 握手面 | 11 |
 | `expert-import-dotnet-0day.yaml` | .NET 0day 挖掘：Kestrel/ASP.NET Core 认证边界与请求走私、System.Formats.Nrbf 反序列化、NuGet/MSBuild 供应链、Runtime/WPF 审计 | 10 |
+| `expert-import-v8-wasm-tc.yaml` | V8 Wasm type-confusion 挖掘：攻击面清单（W1-W15 + CVE 映射）、tier 差分 oracle、shared GC 对象 dispatch 盲区、wrapper 静态类型守卫、Maglev 多因子方法论、未决高信号攻击面与死面清单、确认 bug 骨架模式库 | 10 |
+| `expert-import-colony-methodology.yaml` | 多 agent fuzz 群体治理：负面知识分级（Coverage/Refutation）、模式广播 promotion gate、反 Goodhart 适应度设计、bandit 分配 + 三阶段配比 + 反聚类 | 4 |
+| `expert-import-trajectory-techniques.yaml` | 本机研究轨迹沉淀（9 个实机会话）：V8 enum-cache 越界读全链、glibc tcache poison/off-by-one、老 V8 自建 d8 SOP、libxml2 整数溢出 mmap 邻接、QEMU 设备 UAF 死路闭环、krb5 golden ticket、pkexec harness 证明法、Laravel Blade SSTI、FreeType 最小字体构造、--predictable 取证标定、CVE 修复定位工作流 | 13 |
 
-条目 `kind` 覆盖 `idea`（思路判断）/ `technique`（具体技术）/ `sop`（步骤流程），`domain` 统一 `whitebox`（代码级 0day 挖掘场景，域选错会被检索过滤）。每条均含 `criteria`（成立/失效判定标准）与 `reviewer`（审定人），符合专家知识入库规范；所引 CVE 已对 OSV 核实、源码路径已对 GitHub 核实。
+条目 `kind` 覆盖 `idea`（思路判断）/ `technique`（具体技术）/ `sop`（步骤流程），`domain` 按主题选择（`whitebox` = 代码级 0day 挖掘；`binary` = V8/Wasm 引擎漏洞与 fuzz 方法论——域选错会被检索过滤）。每条均含 `criteria`（成立/失效判定标准）与 `reviewer`（审定人），符合专家知识入库规范；所引 CVE 已对 OSV 核实、源码路径与 fix commit 已对仓库原文核实。
 
 ## 导入用法
 
@@ -22,6 +25,9 @@
 ```bash
 zhishi expert import expert-import-go-0day.yaml --reviewer j0hnexp
 zhishi expert import expert-import-dotnet-0day.yaml --reviewer j0hnexp
+zhishi expert import expert-import-v8-wasm-tc.yaml --reviewer j0hnexp
+zhishi expert import expert-import-colony-methodology.yaml --reviewer j0hnexp
+zhishi expert import expert-import-trajectory-techniques.yaml --reviewer j0hnexp
 ```
 
 `reviewer` 取值顺序：条目字段 → `--reviewer` 参数兜底 → 都没有则该条拒绝导入。

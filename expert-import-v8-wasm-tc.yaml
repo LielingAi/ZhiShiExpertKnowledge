@@ -1,0 +1,223 @@
+# ZhiShi 专家知识导入 — V8 Wasm type-confusion 挖掘（源自 colony_agent 多 agent fuzz 系统）
+# 用法：zhishi expert import expert-import-v8-wasm-tc.yaml --reviewer j0hnexp
+# domain 统一 binary（V8/Wasm 引擎漏洞挖掘；fuzz 方法论属 binary 域配方面）。reviewer 可被 --reviewer 覆盖。
+# 证据：攻击面/防御/fix commit/CVE 编号均出自 colony_agent 仓库（README、prompts/v8/*、genomes/*.md、
+#       490877756/490877757/490877758/491318550.md 四份已修复 bug 报告），照抄原文路径与编号。
+# 注意：导入不去重，同一文件只导一次；重复了用 zhishi expert rm 清理。
+
+- title: V8 Wasm type-confusion 攻击面清单（W1-W15 + 模式库）
+  kind: idea
+  domain: binary
+  applicability: 对 V8 Wasm GC 类型系统（canonicalization、GC 优化器、JS↔Wasm 边界、speculative inlining、跨模块共享）做审计/复现/新特性评估的起点清单；也是定向 fuzz 的选题表
+  content: |
+    Tier 1：W1 canonical type-ID 溢出/截断（canonical-types.cc、value-type.h 的 20-bit HeapTypeField；CVE-2024-2887/-6100/-8194）；
+    W2 canonicalization nullability 混淆（EqualValueType 哈希忽略 nullable；CVE-2025-5959）；
+    W3 优化器消除类型检查（wasm-gc-typed-optimization-reducer.h；关联 CVE-2024-2887 TypeCheckAlwaysSucceeds）；
+    W4 JS↔Wasm 边界（wasm-compiler.cc FromJS、wasm-objects.cc；CVE-2024-4761、Issue 1462951）。
+    Tier 2：W5 wasm-in-js-inlining-reducer.h；W6 speculative call_indirect 内联+deopt（M137+）；
+    W7 循环头类型窄化（TypeSnapshotTable）；W8 跨模块类型共享；W9 struct/array 字段偏移（struct-types.h、wasm-objects-inl.h）。
+    Tier 3：W10 Wasm null vs JS null；W11 函数签名子类型（wasm-subtyping.cc）；W12 GVN 合并类型检查；
+    W13 DCE 删除 trapping 检查；W14 BranchElimination；W15 wasm-load-elimination-reducer.h 跨 GC safepoint。
+    模式库：P1 20-bit 截断（grep -rn "HeapTypeField\|kHeapTypeBits" src/wasm/）；
+    P2 nullability 被等值忽略（CVE-2025-5959）；P3 错误推断导致检查消除（CVE-2024-2887）。
+    关键审计函数：TypeCheckAlwaysSucceeds()、IsHeapSubtypeOfImpl()、EqualValueType()、HashValueType()、
+    FromJS()/JSToWasmObject()、AddRecursiveGroup()、WasmGCTypeAnalyzer::ProcessTypeCast()、Union()。
+  criteria: 清单中任一 surface 能定位到当前 V8 源码 file:line 且同时找到「代码假定的类型不变量」与「未强制该不变量的检查点」两处即成立；2+ 独立审计确认防御完整且无盲点的 surface 转死面。
+  tags: v8, wasm, type-confusion, attack-surface, cve
+  reviewer: j0hnexp
+
+- title: shared Wasm GC 对象穿透枚举型 dispatch 的盲区（TC-001/002 谱系）
+  kind: technique
+  domain: binary
+  applicability: 审计 JS 引擎中「新对象类型加入后既有 IsShared()/InstanceType 枚举型 dispatch 未同步更新」的场景；任何运行时引入新堆对象类型时排查既有 switch/dispatch 全覆盖
+  content: |
+    已修复 bug（chromium-review CL 7652575/7652578/7653799/7653296）：
+    - CSA SharedValueBarrier 快路径缺 WASM_STRUCT_TYPE/WASM_ARRAY_TYPE 检查 → debug DCHECK !IsShared(*value) 崩溃（objects.cc:2885），release 抛 TypeError；
+    - CanBeHeldWeakly 的 C++（objects-inl.h:2121 正确拒绝）与 CSA（builtins-collections-gen.cc:481 漏掉）双实现结论不一致 → new WeakRef(sharedWasmStruct) DCHECK 崩溃；
+    - Runtime_WasmTableInit（runtime-wasm.cc:934-938）把非 shared 的 trusted_instance_data 同时传给 regular/shared 两参数；
+    - Drumbrake 解释器 InitGlobalAddressCache() 缓存 ByteArray 裸 Address，压缩 GC 移动后悬空 → SEGV_ACCERR。
+    群体确认：TC-001 = class_name()（js-objects.cc:582-588）的 IsShared() 枚举漏 WasmStruct/WasmArray，
+    触发链 WeakSet.add(sharedWasmStruct) → ThrowTypeError → NoSideEffectsToString → class_name() → UNREACHABLE；
+    官方只堵 GotoIfCannotBeHeldWeakly（builtins-collections-gen.cc:495-502）一个入口，根因未修，
+    同仓库 genome-039 列出 8+ 未防护调用点（json-stringifier.cc:869、api.cc:7035 DeepFreeze、value-mirror.cc:310 等）。
+    TC-002 = marking-visitor-inl.h:704 的 DCHECK(!InWritableSharedSpace(key))，shared Wasm 对象作 ephemeron key 触发；
+    genome-034 给出 13 处 GC DCHECK 位点全表（sweeper.cc:573、marking-barrier.cc:110/131、heap-write-barrier.cc:117/251 等）。
+    通用挖法：引入新类型后 grep 全部 IsShared()/InstanceType switch/枚举型 dispatch，逐点问「新类型覆盖了吗」。
+  criteria: 以最小 PoC（shared struct 模块 + 一个 JS API 调用）在 debug d8 复现 DCHECK/UNREACHABLE，且崩溃点位于枚举型 dispatch 未覆盖新对象类型处即成立；dispatch 已显式覆盖目标类型、或 release+--verify-heap 无异常则失效。
+  tags: v8, wasm, shared-struct, dispatch, gc, type-confusion
+  reviewer: j0hnexp
+
+- title: 编译 wrapper 中「静态类型判定运行时行为」模式（TC-003/004/005/006）
+  kind: technique
+  domain: binary
+  applicability: 审计 JIT/引擎中所有「用静态类型信息决定是否执行运行时操作」的位点；尤其新特性（shared bit、exactness bit）加入类型系统后 wrapper/lowering 层的 IsSubtypeOf 型守卫
+  content: |
+    根因模式：Turboshaft wrapper（wrappers-inl.h:138）用 IsSubtypeOf(type, kWasmSharedExternRef)（TYPE-based）决定是否 unshare 字符串；
+    Torque 路径（js-to-wasm.tq:881）与 C++ 路径（wasm-objects.cc:3762）用 Is<String> && InSharedSpace（VALUE-based）。
+    修复 64b77c7889e 后仍不完整——(ref shared any)/(ref shared eq) 等非 extern 类型路径照漏，tier-up 后 shared string 泄漏进 JS。
+    TC-006：JSToWasmObject 的 GenericKind::kString 分支（wasm-objects.cc:3698）直接 if (IsString(*value)) return value;，
+    缺 ConvertToSharedIfExpected；kExtern(3612)/kAny(3627) 分支都有。
+    系统化审计法（genome-118）：grep IsSubtypeOf/is_reference_to/type.is_shared() 命中后逐个分类
+    validation-context（安全）vs codegen-context（可攻击）；对 codegen 位点问：
+    「静态类型是超类型时，运行时值仍可能携带该属性吗」。
+    反向：JS→Wasm 方向同样查 non-shared string 是否漏 Share。
+  criteria: 找到 codegen/runtime 上下文中的类型守卫，并构造「声明类型为不含该属性的超类型、运行时值实际含该属性」的输入产生 tier 间行为差异（如 tier-up 前后 %IsSharedString 翻转）即成立；位点已改 value-based 检查或由 validation 层前置保证则失效。
+  tags: v8, wasm, wrapper, type-based-guard, shared-string, tier-up
+  reviewer: j0hnexp
+
+- title: 编译 tier 差分 oracle——静默 miscompilation 挖掘法
+  kind: sop
+  domain: binary
+  applicability: 对任何「规范要求各编译层语义一致」的目标（JIT 引擎、Wasm 运行时）挖静默 miscompilation/类型混淆；替代 crash-only 模糊测试
+  content: |
+    核心论点：任何良类型 Wasm 模块在 Liftoff 与 TurboFan 上的输出分歧本身就是 bug——规范要求两 tier 同值，
+    无需等 SIGSEGV 即可捕获静默类型混淆。
+    1. 差分 preset：wasm-tc（Liftoff vs TurboFan，主 oracle）、wasm-interop（jitless vs Liftoff vs TF）、
+       wasm-deopt（Liftoff vs speculative inlining）、wasm-gc（null-check 消除变体）；
+    2. IR 观察：wasm_graph.py --diff "WasmGCOptimize" "WasmLowering" 看哪些 WasmTypeCast/AssertNotNull/TrapIf
+       被哪一 phase 消除；--types、--trace 42 溯源类型标注；
+    3. 第三 tier 扩展：--wasm-interpret-all 解释器有独立 DoRefCast（wasm-interpreter.cc:5826），
+       switch 缺 kExtern/kExn/kAny 分支命中 UNREACHABLE(5855)——把解释器加入差分面放大发现面；
+    4. d8 旗标对：--liftoff-only --no-wasm-tier-up vs --no-liftoff --no-wasm-lazy-compilation；
+       危险对照 --experimental-wasm-skip-null-checks；
+    5. 配套生成器：overflow（--target-id 1048576）、nullability（--groups 50）、hierarchy（--depth 20）、
+       elimination、boundary、cross-module；概率工具 overflow/sim/birthday。
+    排除步骤：先证明分歧不是规范允许的行为差异或 flag 组合语义不同，再最小化定位根因 file:line。
+  criteria: 同一良类型模块在两 tier 输出分歧、可最小化且根因定位到 file:line 即成立；分歧被证明是规范允许差异或 flag 语义不同则排除。
+  tags: v8, wasm, differential, oracle, miscompilation, liftoff, turbofan
+  reviewer: j0hnexp
+
+- title: Clean 测试是情报——防御命名 + 盲点枚举 + 绕过角度排序
+  kind: technique
+  domain: binary
+  applicability: 任何白盒漏洞挖掘中测试结果为 clean 时的下一步决策；防止「没打穿=安全」的结论性误读
+  content: |
+    五步循环 BUILD→TEST→OBSERVE→TROUBLESHOOT→IMPROVE。CLEAN 结果强制三动作：
+    ①命名防御（哪个检查、file:line）；②读该检查源码；③问它不覆盖什么。
+    7 类绕过角度（固定顺序）：类型复杂度（更深层级/rec group）→ canonicalization（多模块/哈希碰撞/瞬时溢出）
+    → 优化（复杂 CFG/循环头/unreachable 块）→ 边界（JS↔Wasm 往返/跨模块共享）
+    → tier 错配（Liftoff vs TurboFan/deopt）→ 时序（GC 时机/并发编译/惰性编译）
+    → 组合（canonicalization 溢出+优化消除+边界）。
+    Maglev 版盲点顺序：边界值类型（NaN/-0/Symbol/BigInt/Proxy/null prototype/detached ArrayBuffer）
+    → 排序攻击（guard 后、被保护操作前的副作用）→ 别名攻击 → 状态攻击（deprecated map/饱和计数器/megamorphic IC）
+    → 路径攻击（无 guard 路径到达同一操作）→ tier 攻击（OSR/lazy deopt/tier-up）→ 并发攻击（GC/并发编译）。
+    每轮报告强制字段：guard_found / blind_spots_identified / inconsistency（Site A vs Site B file:line）/
+    next_angle / confidence；3+ 角度耗尽 = early exit 信号。
+    反模式：「Types are sound」是 kill 信号——worker 只确认 ref.cast 正常工作 = 测试了开发者已测过的东西。
+  criteria: clean 结果产出「防御名(file:line) + 该防御不覆盖的盲点 + 下一绕过角度」且下一角度来自盲点分析即成立；报告只写「防御坚固」而无盲点/绕过计划则判无效。
+  tags: v8, maglev, clean-test, defense-naming, blind-spot
+  reviewer: j0hnexp
+
+- title: 修复 commit 反推 sibling bug——git 历史研究法
+  kind: technique
+  domain: binary
+  applicability: 对任何开源引擎/大型代码库做定向挖掘时的目标选择与横向扩展；把已修复 bug 转成未修复变体的生产线
+  content: |
+    标准命令组：git log --oneline --grep="Revert\|Reland"（脆弱代码=高优先级）；
+    --grep="fix\|bug\|crash\|regress\|CVE"（修过 bug 的 sibling 是目标）；
+    --diff-filter=A 找新子系统；wc -l | sort -rn 找复杂大文件。
+    实战谱系：TC-001 根因未修只堵入口 → 扫 8+ 其他调用点；TC-006 kString 漏共享 → 查 kFunc 是否同样漏；
+    TC-003 只修 wrapper → 查解释器独立 WasmToJSObject（wasm-interpreter-runtime.cc:2590-2604）是否漏 unshare。
+    revert/reland 交火区（genome-003/114）：WasmToJS/JSToWasm 合并被 revert（252ea756a14）后 reland（27a83f0b039）；
+    waitqueue Reland^2（480966b4b4c）被 revert 两次（aaecfb4eb0b 互斥锁错、b95c94a3ccd shared isolate 内存账目）。
+    pattern-export：确认 bug 后以 grep 把 bug 形状带到 sibling 子系统——例：Cast<ChangeOp> 应为
+    Cast<TryChangeOp>（687ac3ebd63，instruction-selection-normalization-reducer.h:89）推广为全 Turboshaft 的
+    case Opcode::kX → Cast<YOp> 错配审计。
+  criteria: 以固定 grep 命令在目标代码库定位到「同模式、不同位点」的未修复候选，且能指出该位点缺哪个检查即成立；grep 命中全部已被原 fix 覆盖、或模式因架构不同不成立则失效。
+  tags: v8, git-history, sibling-bug, pattern-export, revert
+  reviewer: j0hnexp
+
+- title: Maglev 多因子交互空间方法论（IDENTIFY→MAP→COMPARE）
+  kind: technique
+  domain: binary
+  applicability: 对 JIT 编译器（Maglev/TurboFan 类）做机制性审计；单因子测试无效时的假设构造法
+  content: |
+    假设模板：Assumption A × 破坏因子 F × 验证 V 不覆盖 F × 时序 T 让 F 在 V 后生效 × 结构 S 制造条件——
+    单因子假设「几乎总是 clean」，必须多因子。
+    IDENTIFY：机制编目六型（field/flag、enum/mode、validation、invariant、cache、propagation），
+    每机制记 Set by/Read by/Cleared by/Assumption。
+    MAP：全用法位点矩阵 + git log + grep -rl test/mjsunit 测试挖掘。
+    COMPARE 7 类不一致：coverage gap（A 查 B 不查）、propagation gap（A 递归传播 B 只一层）、
+    ordering gap（A 先清 B 后清）、condition gap（is_smi vs is_smi && !is_heap_object）、
+    parameter gap（A 传 mode B 硬编码）、scope gap（A 处理所有 phi B 只处理 loop phi）、
+    timing gap（build 时 vs optimize 时验证）；跨 tier 对比同一操作 = 候选 bug。
+    图验证门槛（Phase B）：原型必须先 v8_graph.py --grep 确认命中目标节点、guard 存在/缺失与假设一致，
+    才许进入 spec 批量测试——「图里没有目标节点：修测试不修假设」。
+    spec 组合测试：{{HOLE}}/{{#BLOCK}} 语法，@db: 值池（numbers.smi_boundary、arrays.holey、
+    objects.proxy、deopt_triggers 等 9 大类），mode each（快扫）→ product（全表）。
+    实战排名：pattern-export 3 bug、source-first 多因子 4、graph dump 4、differential 4；
+    反模式 = 不读源码乱测、单因子（几乎零产出）、浅层 1-2 轮、重复测死面。
+  criteria: 假设引用两个代码位点间的不一致（两侧 file:line）且图验证确认命中目标节点后才规模化测试即成立；单因子假设、或未做图验证就批量跑 spec 判无效。
+  tags: v8, maglev, jit, multi-factor, inconsistency
+  reviewer: j0hnexp
+
+- title: V8 Wasm 未决高信号攻击面集（精确 fix commit + 当前 gap）
+  kind: idea
+  domain: binary
+  applicability: 后续对 V8 Wasm 定向挖掘的选题清单；每条都是「已定位 file:line + 已命名防御 + 未验证盲点」的可执行假设
+  content: |
+    按信号强度排序：
+    - exactness 不一致（genome-017，最高信号）：wasm-inlining-into-js.cc:300 对 final 类型用 kExactMatchOnly
+      触发 IsCastToCustomDescriptor 守卫，GetExactness（wasm-compiler-definitions.cc:32-36）返回
+      kExactMatchLastSupertype 守卫不触发 → 独立编译路径可能消除本应保留的 ref.cast；
+    - shared 类型 AssertType 全跳过（genome-120）：wasm-gc-typed-optimization-reducer.h:181-183
+      if (type.is_shared()) return;（TODO(mliedtke)）——cast 消除/类型细化对 shared 照跑，安全网关闭；
+    - AcqRel tier 差分（genome-080）：解码器接受 kAcqRel（wasm-constants.h），Turboshaft
+      DCHECK_NE(memory_order, kAcqRel)，Liftoff 静默处理——release 下 DCHECK 剥离后行为未定义；
+    - br_on_cast_fail 窄化缺失（genome-108，commit dad3b1c03cf 官方自认）：fallthrough 类型窄化未实现，
+      条件是 ComparisonOp(WasmTypeCheckOp, Word32Constant(0)) 而分析器只认裸 WasmTypeCheckOp；
+    - Smi 检查静默回归（genome-128）：crrev.com/c/7054524 改类型表示后
+      config.from.AsNonShared() == wasm::kWasmExternRef 静默变 false；fix d86212a39be 只改 4 处；
+      影响 = object_can_be_i31 错 → i31ref 当堆指针 → 受控读 2*smi_value 地址；审计法 grep 'AsNonShared().*==' 全库；
+    - GVN 标签丢失 stale ref（genome-130）：47a3535cddf 修 array.fill/array.new 处 ChangeInt32ToInt64()
+      造 untagged 表示、GVN 去重后 GC 不扫描栈槽；审计法 grep 所有 StoreInInt64StackSlot 残留；
+    - inlining try-catch 帧状态（genome-129）：250e6dbb826 给 CallBuiltin 加 lazy_deopt_on_throw 只覆盖部分
+      builtin——抛异常的转换 builtin（ToBigInt/ToObject）可能绕过 catch；
+    - WasmFX 三连（genome-010/043/060/075）：压缩/非压缩指针混淆（5a64071bf9d、2f8c6526740）、
+      suspend 后内存缓存未重载（74ec0dd3233、8e06a26e126）、EPT 未清（e97587a3751）；
+    - 反序列化弱校验（genome-076）：966e72ab572（max_pages）、66e649c24c6（环破坏重写）、
+      7f4edfc4050（GSAB byte_length 窗口）；未校验项 = initial pages/buffer 一致性/对齐。
+  criteria: 每条攻击面可定位到当前 V8 源码 file:line 与已命名防御、且盲点表述可用 wasm_graph.py --diff 直接观察即成立；对应 fix commit 已落地覆盖该盲点则转死面。
+  tags: v8, wasm, high-signal, gap, fix-commit
+  reviewer: j0hnexp
+
+- title: V8 Wasm「死面」清单——被防御封闭的攻击面（negative results）
+  kind: idea
+  domain: binary
+  applicability: 对 V8 Wasm 这些面做重复审计前先查此表节省预算；同时是「什么防御有效」的正面教材
+  content: |
+    已确认死面（多 worker 交叉确认）：
+    - IsCastToCustomDescriptor + kExactMatchLastSupertype：对 final 类型语义等价，非共享场景 dead；
+      5-bug fix 48c35511792 已修 ProcessBranchOnTarget（bugs 446113731/446113732/446122633/446124892/446124893）；
+    - cont.bind GC roots（6 次标注 dead）；Liftoff 不支持全部 WasmFX 操作；
+    - 跨模块类型共享、W3 优化器类型检查消除、cont 类型边界、struct 字段偏移计算、内存缓存重载、
+      shared 类型 cast 消除、AnyConvertExtern shared bit、configureAll 模式、call_indirect 类型检查、
+      shared funcref 外部创建、table dispatch 签名匹配——均 dead；
+    - WeakMap/WeakSet with shared objects：4 层防御确认 dead；
+    - canonicalization 保留 exactness/nullability：is_equal_except_index() 比较 bit 2 nullable/bit 3 exact/bit 4
+      shared，EquivalentTypes（wasm-subtyping.cc:486）显式查 exact 差异。
+    死面判定标准：2+ worker 独立确认同一防御 + 无未测盲点才登记；1 个 worker 或存在未测盲点 ≠ 死。
+    注意：死面不是永久的——新 operator 类型/新预算级别/已验证模式触及该区域时应重开。
+  criteria: 死面登记含 guard file:line + 确认者 + cycle 即成立；「不可重开」的死面登记本身即为错误（有界搜索中『没搜到』≠『不存在』）。
+  tags: v8, wasm, dead-surface, negative-results, defense
+  reviewer: j0hnexp
+
+- title: Maglev 确认 bug 骨架模式库（Bug #1-#4 的可复用骨架）
+  kind: technique
+  domain: binary
+  applicability: 对 V8 Maglev/TurboFan 做新一轮挖掘时的起步骨架；每条骨架对应已产 bug 的代码形状，直接参数化复用
+  content: |
+    Pattern 1 Stale Cache After Side Effect（Bug #3）：CACHED_THING → SIDE_EFFECT → return val；
+    值池 @db:numbers.smi_boundary / @db:optimization.gc_triggers。
+    Pattern 2 Generator × TDZ（Bugs #1/#3/#4）：function* gen(){ yield; try{ const val=VALUE; yield val }catch(e){} }。
+    Pattern 3 Type Feedback Mismatch：train 用 smi、trigger 用 @db:objects.proxy。
+    Pattern 4 Map Transition During Builtin Callback：arr.forEach(()=>{arr[0]=TRANSITION_VAL})。
+    Pattern 5 Pattern Export：grep -rn "PATTERN_FROM_BUG" src/maglev/ 找 sibling。
+    排名技术：pattern export（3 bugs）②source-first 多因子（4）③graph dump（4，
+    --trace-maglev-graph-building 揭示真实 IR vs 假设 IR）④differential（4，--jitless vs --stress-maglev）
+    ⑤defense-bypass 分析（3 间接）。
+    已知死面示例：Phi untagging 在 Bug #1 后 guard 加于 graph-builder.cc:1234。
+    纪律：骨架原型经图 dump 验证命中目标节点后方可参数化（Phase B 门槛）。
+  criteria: 骨架原型经图验证命中目标节点后参数化即成立；跳过图验证直接跑 spec、或重复已修死面判无效（预算浪费反模式）。
+  tags: v8, maglev, skeleton, bug-pattern, graph-dump
+  reviewer: j0hnexp

@@ -1,0 +1,235 @@
+# ZhiShi 专家知识导入 — 本机研究轨迹沉淀（2026-09 实机会话挖掘）
+# 用法：zhishi expert import expert-import-trajectory-techniques.yaml --reviewer j0hnexp
+# 来源：本机 ~/.zhishi/loop-sessions 真实研究轨迹（V8 CVE-2024-3159 / glibc CVE-2022-0470·2023-6779 /
+#   QEMU CVE-2022-0216 / pkexec CVE-2021-4034 / krb5 CVE-2022-42898 / libxml2 CVE-2022-29824 /
+#   FreeType CVE-2022-27405 / Laravel IXP-Manager / PHP CVE-2024-4577），逐条带会话 id + 行区间证据。
+# domain 按研究主题（binary 主体 / pentest / whitebox）。reviewer 可被 --reviewer 覆盖。
+# 注意：导入不去重，同一文件只导一次；重复了用 zhishi expert rm 清理。
+
+- title: V8 enum-cache 越界读全链——错位读原语编码、fakeobj 升级与 wasm RWX 页 RCE（CVE-2024-3159 系）
+  kind: technique
+  domain: binary
+  applicability: 任何「for-in 优化 / enum cache」同族 V8 漏洞（CVE-2023-4427、CVE-2024-3159 系）的利用；前置：可自建指定 commit 的 d8、gdb、--allow-natives-syntax --predictable
+  content: |
+    触发形状（最小）：object1=1 属性、object2=2 属性、object3=3 属性+defineProperty(d)、object4=4 属性+d；
+    预热 for-in object3 建 cache → delete object3.d → 优化 trigger（回调内 object4.d=1.1 触发 MapUpdater
+    换 map + for-in object1 在新 DescriptorArray 上重建 cache）→ 循环 i≥L 用旧索引读 indices OOB。
+    原语编码：LoadFieldByIndex 偏移 = fe*2+12（tagged）或 (-fe)*2+4（properties 路径）；fe 偶=相对
+    object2 的 4 字节 tagged 读，fe 奇=double 路径 word 3+(fe>>1)；fe 由 enum_indices OOB 槽的 groom Smi 控制。
+    死路与对策：OOB 槽含垃圾指针时写入老年代数组触发写屏障崩溃（r15=cage+0x3ff00000 SEGV_ACCERR，
+    固定页基址可作「野指针=code range」判据）→ 年轻代 holder 承接 + === 指针比较分类（不解引用垃圾）。
+    fakeobj：cover[HIT]=mkd(fakePtr,fakePtr) 后 OOB 读该元素即得伪造对象；再用伪造 DoubleArray/JSArray
+    读受害 Float64Array 的 external_pointer（+48/+56），沙箱关闭时直接绝对读写。
+    RCE 收尾：--predictable 下堆地址逐位稳定；从 WasmTrustedInstanceData 扫描 jump_table_start
+    （TD+0x38~0x50 附近），CODE = jt+0x800 为 RWX 页，写 execve shellcode 执行验收命令。
+  criteria: 成立=在 fix 父提交构建的 d8 上稳定读到错值且无 deopt；gdb 下 indices length=1 而循环按更长 keys 迭代；shellcode 输出 uid=0 且 flag 落盘。失效=触发后被 wrong enum indices deopt（CheckSmi 命中奇数填充词）或读到 cage 端 guard 区崩溃。
+  tags: v8, enum-cache, oob, fakeobj, wasm-rwx, cve-2024-3159
+  reviewer: j0hnexp
+
+- title: 旧版 glibc 换装 + tcache poison → __free_hook → system（受控堆越界写的武器化模板）
+  kind: technique
+  domain: binary
+  applicability: 任何「进程内受控堆越界写」在旧版 glibc 目标上的武器化；前置：能控制分配器流量（大对象、gc 时机）、可换 glibc 运行
+  content: |
+    换 glibc：Ubuntu focal 的 libc6_2.31 + libgcc-s1 deb 解包，用 ld-2.31.so --library-path 跑现成二进制。
+    关键差异：2.31 tcache 无 safe-linking（free 后 fd 是裸指针；2.32+ 被 pos>>12 异或需 heapbase>>12 解密）。
+    邻接控制：先实测「quiet class」——哪些 size class 在深度嵌套调用中不被内部 malloc 扰动
+    （0x100/248B 是 quiet，0x50 会被冲掉）；ArrayBuffer backing 的 free 在 gc 内延迟，需
+    --no-concurrent-array-buffer-sweeping 才同步进 tcache；先 free 的 chunk 后分配先 pop（LIFO 可预测）。
+    泄漏标定：victim.fd 低 2 字节清零得 64KB 对齐窗口 W，读 W 内找 main_arena+0x60 型指针
+    （低 12 位 0xbe0）算 libc 基址；判据代码坑：key>>40n 应写 >>44n（0x5555 前缀是 47 位指针）。
+    poison 链：窗口内找 [fd][key][marker] 三元组 → 写 __free_hook → 逐 pop 直到分配器返回 hook chunk
+    → 写 system → free 命令串 chunk；稳定性差时用 run.sh 重试包装交付。
+  criteria: 成立=2.31 下 free 后读 fd 得原地址（非异或值）；hook 写入后触发 system 且 /tmp/pwned 出现 uid=0。失效=链表中找不到 poisoned entry（tcache 被内部分配污染）或 pop 计数不同步崩溃。
+  tags: glibc, tcache, free-hook, safe-linking, cve-2022-0470
+  reviewer: j0hnexp
+
+- title: 老版本 V8 在新发行版上自建 d8 的完整 SOP（blobless 源码 → gn 构建 → 工具链兼容修复）
+  kind: sop
+  domain: binary
+  applicability: 任何需要「指定 commit 的 Chromium/V8 工具链」的靶场建设；前置：可访问 chromium.googlesource.com、12 核级机器
+  content: |
+    1. 源码：git clone --filter=blob:none --single-branch --branch <版本>（全量 clone 会假死）；
+       gclient sync -D --force --no-history --nohooks（注意是 --nohooks 不是 --no-hooks）；
+       DEPS hook 超时是间歇网络问题，重试即可。
+    2. 构建：gn gen out/rel --args='is_debug=false target_cpu="x64" v8_enable_sandbox=false dcheck_always_on=false'；
+       缺 sysroot 时装 sysroot 脚本。
+    3. 2021 年 V8 + 现代工具链修复清单：python3.12 破坏 jinja2/markupsafe 需补丁；import imp 已删；
+       旧代码缺 cstdint → BUILD.gn cflags_cc 加 -include cstdint；clang 18 需 -fuse-ld=lld + 版本后缀
+       llvm 工具符号链接；bundled clang 与系统 ICU 有 GLIBCXX 冲突时换系统 clang。
+    4. 产物验证：ninja 输出被 | tail 缓冲导致日志假空，用 sleep + ls d8 轮询存在性。
+  criteria: 成立=d8 --version 输出目标版本且 PoC 行为符合预期；失效=gn gen 报 sysroot/flag 错误未按修复清单处理。
+  tags: v8, build, toolchain, d8, 靶场建设
+  reviewer: j0hnexp
+
+- title: 4GB 级整数溢出 → mmap 布局邻接 → 函数指针劫持（libxml2 CVE-2022-29824 族）
+  kind: technique
+  domain: binary
+  applicability: 任何「32 位 size 溢出导致越界写」的库函数（xmlBufAdd/xmlBufferAdd 族）；前置：进程能申请 ~4GB 内存、victim 对象可控布局
+  content: |
+    触发：unsigned int needSize = use+len+2 回绕后跳过 resize，memmove 在 4GB-2 缓冲区末尾写出——
+    ASAN 报 WRITE of size 69632 精确落点在缓冲区末端（先 malloc 大块，再追加 chunk 使 use 越过 2^32）。
+    布局关键：glibc 超大分配走 mmap，且「先分配的 2MB victim、后分配的 4GB 缓冲区」top-down 布局
+    恰好首尾相接（gap=0）——越界写确定性落到 victim 首字节，无需 spray。
+    利用：victim 头部放 {函数指针; char cmd[256]}，payload 在 offset=victim-content 处放 win() 地址
+    + 命令串；越界写覆盖 fp 触发调用即 RCE。与 Canary/NX/RELRO 无关（不碰栈/GOT）。
+    差分证明：修复版同 harness 无 ASAN 报错——同一 harness 双链接是漏洞成立的硬证据。
+  criteria: 成立=ASAN 版 100% 复现 WRITE of size 69632；非 ASAN 版 win() 被调用且 flag 读出。失效=victim 与 4GB 缓冲之间出现其他映射（布局不邻接）。
+  tags: libxml2, integer-overflow, mmap, function-pointer, cve-2022-29824
+  reviewer: j0hnexp
+
+- title: QEMU 设备 UAF 靶场全链路——guest 侧 SCRIPTS 触发、堆布局审计与死路闭环（CVE-2022-0216）
+  kind: sop
+  domain: binary
+  applicability: 任何 QEMU 设备模拟器漏洞（SCSI/块设备族）；阶段：复现 → 利用可行性研判 → 负结果闭环；前置：能编译 QEMU+内核+initramfs 的容器
+  content: |
+    1. 源码 diff 定位修复（相邻版本的设备文件差异 + 修复 commit）。
+    2. guest 用户态 trigger：PCI 扫 vendor/device——**BAR1 才是 MMIO 寄存器、BAR0 是 I/O 端口**
+       （按 resource 文件 flags 判断）；SCRIPTS 序列：select→ATN→msgout ABORT TAG→INQUIRY→二次
+       ABORT 使 scsi_req_cancel 对已释放 req 读 req->enqueued → UAF（ASAN heap-use-after-free）。
+    3. 环境件：QEMU --without-default-features 精确配置；内核 defconfig + busybox 静态 initramfs
+       + 静态 trigger；assert(s->current) 的存在使不同触发序列落在不同崩溃点，需区分。
+    4. 利用性审计（换同族设备直接复用）：guest 可控 chunk 普查——scsi-generic 的 g_malloc 需 /dev/sg
+       （容器 cgroup 拒绝，mknod 无效）；NVMe bounce buffer guest 可控但生命周期受限；QEMU 禁 NDEBUG；
+       TB 分配不走 glibc malloc；buffer 经 qemu_blockalign 落 brk 堆可邻接。
+    5. 换 glibc 2.31 调试：debootstrap focal → chroot 编译非 PIE 失败/无 /proc 断点 → 宿主 gdb
+       set sysroot + 2.31 loader 显式加载；符号链接 cp -L 实体化。
+  criteria: 成立=ASAN 与 gdb 证实 UAF 读已释放 req；「利用不可行」结论需 6 项障碍全部被独立实验证实（安全链接、chunk 类、/dev/sg、NDEBUG、TB 分配、tcache 归属）。失效=触发序列落在 assert 崩溃而非 UAF。
+  tags: qemu, uaf, scsi, lsi53c895a, cve-2022-0216, 负结果闭环
+  reviewer: j0hnexp
+
+- title: krb5 PAC 整数溢出 → KDC 侧信息泄露 → golden ticket 端到端（CVE-2022-42898）
+  kind: technique
+  domain: pentest
+  applicability: Kerberos KDC / PAC 解析类漏洞；前置：可自建 realm、掌握 krbtgt 密钥
+  content: |
+    根因：k5_pac_parse 对 PAC header 的 offset+size 无溢出检查，k5_pac_locate_buffer 以 base+Offset
+    解引用——构造 ulType=CLIENT_INFO（=10，写错 ulType 得 ENOENT 是常见坑）及多 buffer 使越界可控。
+    原语：read=可控偏移 8 字节读；write=SERVER/PRIVSVR_CHECKSUM 的 zero-fill 写——但实测该写总命中
+    相邻 chunk header（写原语是死路，负结果必须实验证实而非推断）。
+    信息泄露：恶意 PAC 放 victim 前 K 字节（K=0x900 实测命中），krb5_kdc_verify_ticket 返回 0（通过校验！），
+    读出内容含 victim 堆指针。
+    端到端：两 realm 互信 + salt 对齐（跨域 krbtgt 的 salt 非默认值，从 keytab 十六进制转储读出实际
+    salt 字符串再 string2key 校验）→ 用 krbtgt key 伪造含恶意 PAC 的 TGT → 成功拿服务票据。
+  criteria: 成立=krb5_kdc_verify_ticket 返回 0 且泄漏值与实际堆地址一致；golden ticket 能换取服务票据。失效=校验和验证失败（KDC 返回 Generic error）或 salt 不匹配解密失败。
+  tags: kerberos, pac, golden-ticket, information-leak, cve-2022-42898
+  reviewer: j0hnexp
+
+- title: glibc 2.38 __vsyslog_internal off-by-one 复现与老 glibc 新工具链编译坑（CVE-2023-6779）
+  kind: technique
+  domain: binary
+  applicability: glibc syslog 族漏洞及任何「老 glibc 源码在新 gcc 上编译」的场景；阶段：复现与定性
+  content: |
+    机制：openlog 标识符长度决定 header l，与消息长度共同使 vsnprintf 填满 1024 字节 malloc 缓冲后，
+    末尾 NUL 写出边界 1 字节——相邻 chunk 的 size 低字节被清（观测：B 的 mchunk_size 0x501→0x500）；
+    用 openlog("AA",0,LOG_USER)（l=23）校准而非 "AAA"。
+    编译坑：Ubuntu gcc 13.3 经 distro 补丁默认定义 _FORTIFY_SOURCE=3 导致 rtld 链接失败——
+    需 CFLAGS="-O2 -g -U_FORTIFY_SOURCE"（-Wp,-U 无效）；syslog.c 一处 always_inline 内联错误需补丁；
+    源码用 GitHub 镜像 tarball（ftp.gnu.org 与 sourceware snapshot 均不可达）。
+    差分验证：同一 poc 分别链接系统 glibc 2.39 与漏洞版 2.38，只有漏洞版 size 0x501→0x500。
+    定性：1 字节 NUL 越界写无读写/执行能力，DoS-only——定性先于盲目利用投入。
+  criteria: 成立=漏洞版运行后 B chunk size 0x501→0x500、修复版不变；失效=编译产物仍报 fortify/内联错误。
+  tags: glibc, syslog, off-by-one, fortify, cve-2023-6779
+  reviewer: j0hnexp
+
+- title: pkexec argc=0 在现代内核/glib 下的失效机制与 harness 证明法（CVE-2021-4034）
+  kind: technique
+  domain: binary
+  applicability: 经典 setuid 本地提权漏洞在新环境复现受阻时的「变通证明」；阶段：靶场建设与证明
+  content: |
+    两个环境变异（直接导致公开 PoC 失效）：① WSL2 内核把 execve(argc=0) 归一化为 argc=1+argv[0]=""
+    （连 raw syscall 也一样，是内核行为）；② glib 2.80 的 g_find_program_in_path 恒返回绝对路径
+    （canonicalize），GCONV_PATH 相对路径把戏失效。
+    harness 证明法：pkexec main 以 -Dmain=pkexec_vuln_main 编译成对象，wrapper 显式传 argc=0 并手动
+    设置 OOB envp；自制 oldglib_shim.c 模拟旧版 g_find_program_in_path（返回相对路径）链接进 harness，
+    端到端复现 GCONV_PATH=./pwnkit → gconv 模块加载 → root 载荷执行——证明「漏洞成立，是环境变异
+    挡住 PoC」而非漏洞不存在。
+    细节：GCONV_PATH= 目录放 pwnkit/ 子目录（gconv-modules 指向模块），PATH 放名为 GCONV_PATH=./pwnkit
+    的可执行文件，CHARSET 环境变量触发路径查找。
+  criteria: 成立=harness 以 victim 身份运行时 gconv 载荷被 setuid root 上下文加载（/root/pwned 落盘）；失效=内核/glib 变异未隔离时直接跑公开 PoC 无输出。
+  tags: pkexec, setuid, gconv, harness, cve-2021-4034
+  reviewer: j0hnexp
+
+- title: 浏览器引擎 CVE 修复定位工作流与利用性证伪（NVD→crbug→git→代码路径逐平台证实）
+  kind: idea
+  domain: binary
+  applicability: 任何「CVE 但无公开 PoC」的浏览器引擎漏洞；阶段：情报收集 → 根因 → 利用性研判
+  content: |
+    修复 commit 定位：公开报道的 bug 号可能错——正确路径 = NVD API 的 references → crbug 号 →
+    git log --grep=<crbug> → 修复 commit → 取 parent 作为漏洞版 checkout。
+    根因链与绕过面：正向路径有兜底检查，lookbehind 的 read_backward 路径绕过该检查——
+    「检查的绕过面」比漏洞本身更可复用。
+    利用性证伪：逐平台代码路径证实（x64/IA32 的 32-bit immediate、bytecode offset24 无截断、
+    release 无 OOB 只有 dcheck build DCHECK）——负结果由代码路径逐一证实，而非猜测。
+    情报渠道：DDG lite、r.jina.ai 反渲染读取、sourcegraph 流式 API；从旧版 Chrome DEPS 反查 v8_revision。
+  criteria: 成立=用 NVD references 的 crbug 号在 git log 中 grep 到修复 commit；dcheck build 触发 DCHECK 而 release 不崩。失效=用公开报道的 bug 号搜索一无所获（说明走错了号）。
+  tags: v8, cve, patch-locating, negative-results, methodology
+  reviewer: j0hnexp
+
+- title: Laravel Blade SSTI→RCE——patch-diff 驱动挖掘、最小复现与部署验证（IXP-Manager 实例）
+  kind: technique
+  domain: whitebox
+  applicability: 任何 Web 框架「模板/邮件组件把用户输入当模板」类漏洞；阶段：补丁分析 → PoC → 真实环境验证
+  content: |
+    挖掘：git diff 相邻版本逐文件看——真正修复在 Mailable 的 prepareBody：旧代码把用户可控内容
+    （邮件标题/正文）拼进 Blade markdown 后 compileString，@php echo shell_exec("id"); @endphp
+    直接进生成的 PHP 文件被执行。
+    最小复现：composer 装 illuminate/view 即可离线复现（不需要完整框架）；Blade::compileString
+    + evaluate 两步复现编译→执行链。
+    攻击面定位：目标路由在 web-auth 组（最低权限客户即可）、CSRF token 从页面 meta 取、对象 id 从
+    模板 data-object-id 枚举。
+    部署验证：PHP 8.4 需 ondrej PPA（keyserver 返回 armored key 需 gpg --dearmor）；php artisan serve
+    在容器里反复变僵尸，稳定方案是 php8.4 -S 且必须从 public/ 目录起（server.php 用 getcwd 定位）；
+    CSRF token 随 session 轮换需重新抓取。
+  criteria: 成立=真实实例上 exploit 输出 id;whoami 结果且落盘文件可读；失效=403/419（CSRF 或权限不足）。
+  tags: laravel, blade, ssti, rce, patch-diff
+  reviewer: j0hnexp
+
+- title: FreeType NE 字体解析 NULL deref——最小恶意字体构造与差分验证（CVE-2022-27405）
+  kind: technique
+  domain: binary
+  applicability: 字体/文件格式解析器漏洞的最小复现；阶段：PoC 构造与定性
+  content: |
+    根因：face_index 越界（FNT 只有 1 个 face），FNT_Size_Request 解引用 NULL 的 face->font
+    （SEGV 地址恰为结构偏移 0x18）。
+    最小字体构造：Python 手工拼 NE 字体——MZ 头 + 0x40 处 'NE' magic + resource table offset + 资源
+    计数；用 struct.unpack_from 校验每个字段落点。
+    验证三板斧：ASAN 编译抓 SEGV 现场；FT_New_Face 返回值差分（漏洞版 0=成功、修复版 6=Invalid_Argument）；
+    gdb 断点确认崩溃函数。
+    定性：NULL deref DoS 无读写/执行能力——格式解析器漏洞先做「对象生命周期+可控性」定性，
+    再决定是否投入利用。
+  criteria: 成立=漏洞版 ASAN 报 SEGV at 0x18 且 FT_New_Face 返回 0；修复版同输入返回 6。失效=字段偏移拼错导致直接报格式错误。
+  tags: freetype, font-parsing, null-deref, cve-2022-27405
+  reviewer: j0hnexp
+
+- title: V8 --predictable 模式堆取证标定法（gdb + DebugPrint + 压缩指针算术）
+  kind: technique
+  domain: binary
+  applicability: 任何 V8 内存破坏漏洞的调试标定；阶段：触发后到利用前的「翻译原语」阶段
+  content: |
+    --predictable + 固定脚本 → 跨运行地址逐位一致，gdb 与非 gdb 运行地址相同，可离线硬编码常量；
+    但脚本文本任何编辑都会整体移动布局（加一行 DEBUG 都要重标定），标定值只在「同一脚本+同一 cwd+
+    同一二进制」下成立（拷贝的二进制=不同 snapshot 布局）。
+    取证工具链：%DebugPrint 打对象/descriptor 地址；gdb batch 脚本 run --allow-natives-syntax
+    --predictable + x/8wx；压缩指针算术（奇数=对象、偶数=Smi>>1）；descriptor array 头布局
+    （map@0、length@4、enum_cache 压缩指针@12）；崩溃指令形态 mov 0xb(%rcx,%r15,2),%r9d
+    反推 LoadFieldByIndex 的偏移参数。
+    坑：let escape 在 TDZ 报错（跨函数用 var）；--trace-feedback-updates 在 12.5 不存在（--help 查真名）；
+    gdb 下 ASAN 二进制可能因 shadow 冲突无法初始化。
+  criteria: 成立=两次同脚本运行地址一致且 gdb 断点读到的结构与 DebugPrint 吻合；失效=改脚本后旧常量读出垃圾（必须重标定）。
+  tags: v8, predictable, gdb, heap-forensics, 标定
+  reviewer: j0hnexp
+
+- title: 平台专属参数注入漏洞的验证边界——0xAD 软连字符绕过（CVE-2024-4577）的跨平台策略
+  kind: idea
+  domain: whitebox
+  applicability: Windows Best-Fit 编码映射类漏洞（CVE-2012-1823 变体族）在非 Windows 环境的验证策略
+  content: |
+    根因链：skip_getopt 只检查 '-' 的偏移列表，软连字符 0xAD（%AD 编码）不在列表内 → Windows
+    Best-Fit 编码把 0xAD 映射为 '-' → getopt 照常解析 -d 注入 php.ini 达成 RCE。
+    验证边界：Linux 上 0xAD 不映射为 '-'，无法端到端复现；正确姿势是用真实目标版本做代码逻辑级
+    验证（证明 skip_getopt 的字符检查集合确实不含 0xAD、注入参数的解析路径成立），把「平台编码
+    映射」作为环境前置条件显式声明——避免在错误平台上无限调试 PoC 并把失败归因成「漏洞不成立」。
+  criteria: 成立=代码审计证明 skip_getopt 检查集合不覆盖 0xAD 且参数注入路径可达；失效=试图在 Linux 端到端复现并归因于「漏洞不成立」。
+  tags: php, best-fit, parameter-injection, cve-2024-4577, 验证边界
+  reviewer: j0hnexp

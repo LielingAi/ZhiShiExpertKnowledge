@@ -1,0 +1,82 @@
+# ZhiShi 专家知识导入 — 多 agent fuzz 群体治理方法论（源自 colony_agent 的 fable_2e 方法论与 queen/worker 设计）
+# 用法：zhishi expert import expert-import-colony-methodology.yaml --reviewer j0hnexp
+# domain 统一 binary（fuzz 组织方法论服务 binary 域的 fuzz-runner/delegate_task 工作流）。reviewer 可被 --reviewer 覆盖。
+# 证据：条目内容出自 colony_agent 仓库 fable_2e.md（§3.3/§3.7/§3.8/§3.9/§3.10 + Appendix A 可验证实验）
+#       与 prompts/v8/queen_wasm_tc.md（优先级公式/阶段表/反聚类/死面判定），参数与公式照抄原文。
+# 注意：导入不去重，同一文件只导一次；重复了用 zhishi expert rm 清理。
+
+- title: 负面知识分级——CoverageRecord vs RefutationRecord（修复「没搜到=不存在」）
+  kind: idea
+  domain: binary
+  applicability: 任何多 agent/长周期自动搜索系统（fuzz、漏洞挖掘、自动化审计）的失败记录管理；防止死区记录被后代永久继承、把噪声变成墙
+  content: |
+    有界搜索最古老的错误：把「预算内没发现」记录为「已穷尽」并遗传化（永不失效 + 强制 pivot 定时制造更多）。
+    修复——负面知识按认识论模式分裂：
+    CoverageRecord{region, searched: {operators, budget-class, cycles, coverage 陈述}, mode: sound,
+    reopen-when: 操作符类型扩展 / 预算升级 / 已验证模式触及该区域}
+    vs RefutationRecord{certificate: verifier 输出或不可行证明, mode: complete,
+    permanent: 仅在 verifier 版本不变期间, on-verifier-change: 降级为 CoverageRecord}。
+    经济账：「pay once, never again」只对 refutation 成立；coverage 的正确说法是
+    「每 region × operator-class × budget-class 付一次，且知道自己买了哪种」。
+    运营结果：exhausted-region 注册表从「墙」变成「reopen 队列」（条件满足即可重开的优先前沿）；
+    强制 pivot 只写 coverage 记录、永不写 refutation。
+    可验证实验 A1：mode-split 后应在重开区域恢复发现，否则模式分裂只是记账。
+  criteria: 记录带 reopen 条件且重开后发现新结果即成立；重开从不产出（沦为记账）、或 refutation 结论在 verifier 变更后仍被引用即违约。
+  tags: colony, negative-knowledge, coverage, refutation, methodology
+  reviewer: j0hnexp
+
+- title: Promotion gate——模式广播前必须 k 系独立验证（queen 不高于 verifier）
+  kind: sop
+  domain: binary
+  applicability: 任何由中央协调者向群体广播「通用结论/模式」的多 agent 系统；防止未经验证的泛化以群体级爆炸半径传播
+  content: |
+    第一版漏洞：queen 的 synthesis（本地发现 → 共享模式 → pattern-export 广播进每个后代 prior）
+    完全绕过 evaluator——「用多样性机制本身投递单一文化事件」。
+    四步 gate：
+    1. 发 pattern-candidate feed 事件（带 provenance：哪些 lineage/witness/region）；
+    2. queen 分配给 k 个独立 lineage（默认 k=3）在 held-out 子问题上验证——不在产生该候选的数据上验证泛化；
+    3. k 次通过才升为 pattern-verified 并广播，广播携带验证记录供后代审计；
+    4. 失败候选不丢弃而是 scoped（「在 R1 成立、R2 失败」本身是 coverage 型记录）。
+    可验证实验 A2：gated vs ungated 对比，预测 dead-end 级联显著下降；若 ungated 不更差则本 gate 是仪式。
+  criteria: 所有广播到后代的模式均可追溯到 pattern-verified 事件及验证记录即成立；存在未过 gate 的模式进入后代 prior（审计 feed 事件序列可判）即违约。
+  tags: colony, promotion-gate, verification, broadcast, methodology
+  reviewer: j0hnexp
+
+- title: fitness 仅计 verifier 确认项——deferred credit + peer signal 放逐（反 Goodhart）
+  kind: technique
+  domain: binary
+  applicability: 任何以自动化评分驱动 agent 保留/淘汰/繁殖的群体系统；防止 prose 农场与社交刷分污染选择压力
+  content: |
+    第一版公式 fitness = 10·verified_results + 3·analyses + 3·reusable_building_blocks + peer_signal
+    有两处代理泄漏：analyses 是 evaluator 无法确认的散文；peer_signal 变成「取悦 agent 观众」。
+    修复三原则：
+    1. direct credit 仅 10·verified_results；
+    2. deferred credit——building block 在「被 verified result 使用」时才计 3 分、
+       analysis 在「被后续 verified result 引用」时才计 2 分（promissory note，兑现时才支付）；
+    3. peer_signal 完全驱逐出 fitness，降为 queen 的分配先验（衰减的、咨询性的、不可遗传的）。
+    理由：错的分配先验只浪费一轮预算、可下轮纠正；错的 fitness 分量可遗传，一代代选择出泄漏。
+    可验证实验 A3：原公式下 analysis/verified 比率应随代数膨胀，修订公式下不应。
+  criteria: 任何进入 fitness 的项均可追溯到「通过 evaluator」或「被通过 evaluator 的产物消费」的证明链即成立；发现按未验证散文或社交信号计分的路径即违约。
+  tags: colony, fitness, goodhart, deferred-credit, methodology
+  reviewer: j0hnexp
+
+- title: 群体治理组合拳——bandit 分配 + 三阶段配比 + 反聚类 + 死面登记
+  kind: sop
+  domain: binary
+  applicability: 多 worker 并行做大规模安全审计/漏洞挖掘时的资源编排与防收敛治理；可直接套用于 ZhiShi 类多 agent（delegate_task/fuzz-runner）任务
+  content: |
+    1. 优先级公式：priority = risk × (1-coverage) × freshness × signal_bonus；
+       risk HIGH=3/MED=2/LOW=1；coverage：0 worker=0.0、1 worker 无信号=0.3、2+ 无信号=0.8、有信号保持 0.3；
+       freshness 近期 commit/revert=2.0；signal_bonus 不一致=2.0、有希望模式=1.5、默认 1.0。
+    2. 三阶段配比：Phase 1 覆盖扫描（<60% 高优目标被审计）70% 覆盖/20% 深挖/10% 导出；
+       Phase 2 信号利用（≥60% 覆盖、无确认 bug）20/50/30；Phase 3 模式导出（BUG_ARCHIVE 后）10/30/60。
+    3. 反聚类：同目标最多 2 worker；Phase 1 只要 Tier 1 有未触目标就禁止同目标双开。
+    4. 死面判定：2+ worker 独立确认同一防御 + 盲点分析无剩余可测角度才登记（guard file:line + 确认者 + cycle）；
+       3+ worker 无信号 → 目标风险降级。
+    5. 强化版（fable_2e §3.10）：lineage 分配 = bandit（乐观-不确定性指数，保护期 = 探索奖励自然涌现）；
+       probe 定价（信息价值 > 成本才侦察）；random 走 Luby 重启调度；阶段从 bracket（achievable vs ideal gap）
+       读出而非脚本；stuck 三连诊（representation probe → hardness license → symptom panel）。
+    6. 强制规则：Cycle 1 必建清单才能 spawn；每 SPAWN 必须带 spawn_type/target_id/priority_score/methodology_tier；永不空动作。
+  criteria: 每个 spawn 决策可追溯至公式与阶段表、目标覆盖矩阵随 cycle 单调更新即成立；出现第三名 worker 同目标、或 Phase 1 存在未触 Tier 1 目标却同目标双开即违约。
+  tags: colony, bandit, phases, anti-monoculture, dead-surface, methodology
+  reviewer: j0hnexp
