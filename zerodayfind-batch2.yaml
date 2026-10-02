@@ -1,0 +1,176 @@
+# ZhiShi 专家知识导入 — 领域地形（C 段）+ 利用链编排补遗（B 段）
+# 用法：zhishi expert import egym-set/expert/zerodayfind-batch2.yaml --reviewer j0hnexp
+# 来源：E:\code\kimiSec\zerodayFind（huntzero / kimiSec）——
+#   skills/{foundation-lib,supply-chain,infra,desktop,data-parser}/SKILL.md（V7 领域情报简报）、
+#   skills/counter/references/orchestrator.md（编排模板库）、
+#   skills/ai-agent/references/hypothesis-tester.md（两端验证）、
+#   当我们用AI挖到第一个高危——假设驱动认知审计实战.md（H-2 压缩炸弹定量分析）
+# 注意：导入不去重，同一文件只导一次；重复了用 zhishi expert rm 清理。
+#
+# 【检索纪律】search 只返回 ≤5 条，稳定命中的是 title / applicability / tags；
+#   中文长复合词常捞不出来。故关键词在 title + applicability + tags 三处重复，tags 中英双给。
+
+# ══════════ C 段 · 领域地形（按暴露面选域，不按语言） ══════════
+
+- title: 基础库领域地形——六大失效原理
+  kind: idea
+  domain: binary
+  provenance: user
+  applicability: 审计系统基础库（加密、压缩、正则、并发容器、序列化底层）时用作靶面清单。前置：无，开题定位用。关键词：基础库 / foundation library / 爆炸半径 / 未定义行为 / 畸形输入 / 算法耗竭 / FFI / 信任真空。
+  content: |
+    定位：基础库没有具体靶机，找的是能**污染整条供应链地下水的瘟疫**。0day 专家看到的是"极致性能 + 极高通用性"这对妥协下的深渊。
+    **①爆炸半径乘数**——在基础库挖到洞，若它是框架依赖的解析引擎或网关底层的加密库，你就拥有上万种攻击场景。不必考虑具体业务，**直接在模块的"输入合约"边缘试探**：只要证明该接口能被特定组合引发 panic / abort / 越界，它就是能在任意集成环境引爆的核弹。
+    **②操控未定义行为**——C/C++ 与 Go/Rust 的 `unsafe` 块默认调用者传入合法内容。不合法时不报错，而是 UB；**在 O2/O3 优化下，边界检查、空指针分支这类防线会被编译器静默优化掉**。专攻数值上溢/下溢、非法对齐读取、重叠内存 copy。
+    **③打破公理的畸形输入**——应用开发者期待常规输入，基础库专家期待数学与形态上极其怪异的乱流：Null 指针、长度为负的 `size_t`、超过 2^31-1 的超大块长、被截断的多字节字符（surrogate）、无终止符字符串——专门打击库内用作定位终点的脆弱 `while(*ptr)`。
+    **④算法耗竭（极致不对称）**——正则 `(a+)+` 配 `aaaaaab` 制造灾难性回溯（ReDoS），100 字节载荷烧光 CPU；字典/哈希查找利用默认哈希弱点构造碰撞，把复杂度退化到 O(N²)。
+    **⑤并发与虚假原子性**——死盯未被完整加锁的片段：从"检查数组大小"到"具体寻址写入"之间只要有几微秒间隙，就是 TOCTOU 的绝佳窗口，可把正被回收或已被改写大小的内存区写进去。
+    **⑥FFI 信任真空**——跨语言边界两端理念不接轨：Go 端要求切片不可变、C 端却 free 过一次，回到 Go 的 GC 时触发 double free。喂入"在语言 A 合法、在语言 B 瞬间崩溃"的数据。
+  criteria: 成立=能把目标基础库的每个可疑点归入六原理之一，并指出对应的"输入合约"位置。失效=只在业务逻辑层找 bug 而不看基础库接口；或说不出违反的是哪条原理。
+  tags: binary, foundation-library, blast-radius, undefined-behavior, malformed-input, algorithmic-complexity, redos, toctou, ffi, 基础库, 爆炸半径, 未定义行为, 畸形输入, 算法耗竭, 信任真空
+  reviewer: j0hnexp
+
+- title: 解析库领域地形——六大失效原理
+  kind: idea
+  domain: binary
+  provenance: user
+  applicability: 审计解析库（JSON / YAML / XML / 二进制协议 / 图像格式）时用作靶面清单。**这是 OSS-Fuzz 用户态题最高产的一类**，前置：能读解析循环源码。关键词：解析库 / parser / 元数据欺骗 / 整数溢出 / 状态机耗尽 / 多态反序列化 / 编码错位 / 零拷贝 UAF / OOB。
+  content: |
+    定位：解析器本质是把**完全不受信的字节流**，经数学计算与内存分配，转成**受信任的内部结构（AST/Graph/Object）**的编译器。只看它如何被数据本身操控。
+    **①元数据的绝对欺骗性**——数据体前总带"长度/类型"元数据（Length-Prefix）。在黑客眼里**一切元数据都是谎言**：假定输入声明 2GB 但物理只有 10 字节。库若直接相信该长度 → 分配 2GB（OOM）；或更致命地，移动读取指针（`ptr += length`）时**未用物理缓冲区总长 `remaining_bytes` 做边界约束** → 后续操作引发 OOB Read/Write。
+    **②分配器数学游戏**——输入声明有 10^9 个元素时系统要 `malloc(10^9 * sizeof(elem))`。专家的视线永远在**整数溢出/下溢**：若 10^9 × 8 在 32 位或错误类型转换下溢出成 16，只分配 16 字节，而 10^9 个元素的解析循环不会停 → 向 16 字节堆空间疯狂写入 → 堆腐败与潜在 RCE。
+    **③有限空间的无限复杂拓展**——支持深层嵌套（`[[[[…]]]]`）或引用（YAML 别名 `&a [*a]`）的协议依赖调用栈或自建内存栈。用极少数据量（几十 KB 文本）通过万层嵌套直接干穿 call stack，或用别名展开造成 O(N²) / O(2^N) 的**算法放大**（Billion Laughs）。
+    **④多态身份的反客为主**——若框架支持类型提示（`@type`、`!!python/object`）即允许按数据流指定的 Class 实例化对象，这违反了铁律：**外部数据绝不能决定代码执行流走向**。遍历 Classpath 的脆弱类（gadget chains），构造恶意序列化流迫使其"实例化并触发危险构造函数" → RCE。
+    **⑤编码与隐式转换伪装**——处理变长编码（UTF-8 surrogate pair、`\uXXXX`、截断符 `\x00`）时，内部的"逻辑长度"与实际"字节长度"会错位。用错位让安全过滤层看到的和底层 OS 实际执行的字符串脱节（Null Byte Injection / Path Truncation Bypass）。
+    **⑥零拷贝的幽灵引力**——追求性能的解析器（如 simdjson）不做 `memcpy`，让解析出的对象直接持有原输入 Buffer 的指针切片（StringView/Slice）。而 Buffer 生命周期不随对象走——一旦 Buffer 被清空或复用而成层仍持引用 → **UAF 或越界读**。
+    行动准则：第一目标是从源码中锁定**数学计算（加法/乘法算 Buffer 大小处）**与**指针偏移迭代（`while ptr < end`）**的代码行。
+  criteria: 成立=能定位到解析循环里的「大小计算行」与「指针迭代行」，并把每个可疑点归入六原理之一。失效=只按格式规范找"实现 bug"而不质疑元数据可信度；或说不出具体的越界计算式。
+  tags: binary, parser, metadata-lying, integer-overflow, state-machine-exhaustion, polymorphic-deserialization, encoding-mismatch, zero-copy-uaf, oob, 解析库, 元数据欺骗, 整数溢出, 状态机耗尽, 零拷贝, 越界, 序列化
+  reviewer: j0hnexp
+
+- title: 供应链与构建系统领域地形——五原理（打击构建期）
+  kind: idea
+  domain: whitebox
+  provenance: user
+  applicability: 目标是软件供应链（依赖解析、CI/CD 流水线、包注册协议）时。前置：能看到 `.github/workflows/`、`package.json`、`go.mod`、lockfile 这类"架构图纸"。关键词：供应链 / supply chain / 依赖混淆 / dependency confusion / 生命周期钩子 / lockfile 投毒 / CI-CD / 构建缓存劫持。
+  content: |
+    定位：不要在程序跑起来后找漏洞，那太晚了。靶子是**工厂机器、图纸和搬运工**——最高明的手法是在代码被编译成成品前的"装配时光"写入后门。应用层有 WAF 和沙箱，但构建期的 Runner 与开发者的 `install` 阶段常被视为毫无防备的绝对信任区。
+    **①名称解释权争夺（依赖混淆）**——包管理器面对同名依赖时依赖脆弱的"版本权重 + 多源顺位"规则。企业引用了内网私有源的特有包，攻击者在公共源抢注同名包并赋 `999.0.0` 极高版本号 → 构建时被盲目拉入 → 零对抗的全公司级 RCE。
+    **②生命周期钩子的背叛**——下载一个库与执行一段代码往往是等同的：Python `setup.py`、Node `preinstall` 允许依赖在"安装瞬间"随意起子进程。接管哪怕三四级边角依赖，通过钩子注入系统指令，任何敲下编译命令的机器立刻缴械——**"看代码"的人连代码都没看到就已经是肉鸡**。
+    **③信任锚点的掩目戏法（lockfile 投毒）**——防守方依赖 `package-lock.json` / `go.sum`。在动辄上万行的锁定文件里，趁大型业务合并悄悄改一个内部哈希值和下载域，靠人眼的不可审查性完成"换包手术"。
+    **④流水线的混淆代理决堤**——编译环境（GitHub Actions / GitLab CI）往往持有通往云生产库的超级凭据。若流水线对来自外界的不可信 PR 也执行 `make test`，攻击者提交含恶毒测试样例的代码，高特权测试机立刻运行被劫持的脚本 → 一条 `curl` 榨取 `SECRET_AWS_KEY`。
+    **⑤构筑物缓存的阴魅夺舍**——流水线为省时保留全局缓存（`.npm`、`target/`）。攻击者在一次临时恶意任务中不破坏当前应用，而是把带毒目标文件填进**全局受信任的共享缓存**后退出——之后所有官方发布进程使用该缓存时自动被沾染。
+    行为准则：取消对业务 API 的探测，眼睛死盯 `.github/workflows/`、`package.json`、`go.mod`；推演"谁在读取外部输入（含他人 PR 分支），这股输入能否迫使那台握有云凭据的打包机执行外带命令"。
+  criteria: 成立=能指出具体的构建期信任边界（谁读外部输入、谁持有凭据、缓存/锁文件是否可写）并给出一条可利用路径。失效=只审应用代码不看构建配置；或说不出被利用的是哪条"顺位/钩子/缓存"规则。
+  tags: whitebox, supply-chain, dependency-confusion, install-hooks, lockfile-poisoning, cicd, cache-hijacking, 供应链, 依赖混淆, 生命周期钩子, 锁文件投毒, 构建缓存, 流水线
+  reviewer: j0hnexp
+
+- title: 基础设施领域地形——五原理（改"矩阵"的物理法则）
+  kind: idea
+  domain: redteam
+  provenance: user
+  applicability: 目标是 Kubernetes / 容器引擎 / Controller-Operator / IaC 时。前置：能读到 YAML、Helm chart、Controller 源码或集群 RBAC 配置。关键词：基础设施 / k8s / kubernetes / RBAC / 混淆代理 / 容器逃逸 / hostPath / reconcile / SSRF / IaC 投毒。
+  content: |
+    定位：基础设施里最危险的漏洞不是程序崩溃，而是**集群身份的僭越与底层算力的接管**。核心是自动化编排与声明式状态，充满高特权守护进程与严格的边界（Namespace / Cgroups）——专家看的是这些设计背后的信任真空。
+    **①混淆代理人与特权跃迁**——云原生由几十种 Controller 协力运作。用户提交的 YAML 是低权限的（限在某 Namespace），但 Controller 是集群级高权限。不去突破 API Server，而是在 YAML 的 `annotations`/`spec` 里布设陷阱，**"合理地"欺骗 Controller 用它自己的高权限**跨 Namespace 读写 Secrets 或越权创建特权容器。
+    **②沙箱的物理幻觉与逃逸**——容器只是被 Cgroups 限额隔离的常规进程，并非物理隔离。找一切打破窗户纸的缝隙：可控的 `hostPath` 挂载（尤其 `/etc/cron.d`、`/root/.ssh`、`/var/run/docker.sock`），或能开启 `privileged: true` / `hostPID` / `hostNetwork` 的疏漏——一旦突破，性质从"微服务沦陷"跃升为"拿下物理节点"。
+    **③Reconcile 循环的指令劫持**——基础设施操作多为异步事件驱动回路：控制器读对象状态后调用外部工具（`helm`、`kubectl`、云 SDK）。死盯这个处理过程——若外部输入的集群名/标签名未转义就进入 `exec.Command` 或 Go template，就是宿主上（持有全部云凭据）的毁灭性 RCE。
+    **④天生的 SSRF 迷阵**——K8s 组件生来就要互相调用（WebHook 校验、日志回收端点、OIDC URL）。若这些 URL 可被低权限用户指派，立刻指向 `169.254.169.254`（云 Metadata 服务）盗取 Instance IAM Token，或打内网不鉴权的 ETCD。
+    **⑤声明图纸的静态投毒**——集群由 Terraform / Helm 蓝图构建。视线要延展到**打包渲染环节**：Helm chart 若基于非严格沙箱的 Go `text/template` 渲染，只需提供恶意 `values.yaml`，就能在运维执行部署命令的瞬间夺走其堡垒机控制权。
+    行为准则：眼中只见**特权（RBAC / ServiceAccount）**与**隔离边界（Namespace / Mounts）**；推演"一份低特权用户提交的畸形 YAML，在高特权组件间传阅解析的过程中如何像特洛伊木马一样释放恶意代码，最终撕破隔离铁网"。
+  criteria: 成立=能标出具体的特权主体与隔离边界，并给出"低权限输入→高权限执行"的具体路径。失效=把基础设施当普通 Web 应用审；或说不出被滥用的是哪个 Controller / 哪条 RBAC 绑定。
+  tags: redteam, kubernetes, k8s, rbac, confused-deputy, container-escape, hostpath, reconcile-loop, ssrf, iac-poisoning, 基础设施, 混淆代理, 容器逃逸, 云元数据, 蓝图投毒
+  reviewer: j0hnexp
+
+- title: 桌面混合应用领域地形——六原理（跨维度逃逸）
+  kind: idea
+  domain: whitebox
+  provenance: user
+  applicability: 目标是 Electron / Tauri / CEF 等混合架构桌面应用时。前置：能拿到主进程与 preload 脚本源码、能看到 IPC 通道定义。关键词：桌面应用 / electron / tauri / cef / IPC / preload / 上下文隔离 / 原型链污染 / 自定义协议 / 自动更新。
+  content: |
+    定位：混合架构的核心矛盾是**不可信的渲染呈现层**与**拥有系统最高权限的主控宿主层**之间的冲突。弱点在两者之间的通信桥梁。
+    **①Web 漏洞的质变**——纯 Web 里 XSS 的上限是窃 Cookie/CSRF；桌面应用里 **XSS 只是拿到宿主 RCE 的跳板**。找到任意 JS 执行点后不偷数据，而是探测环境：有没有 `nodeIntegration: true`？有的话一句 `require('child_process').exec(...)` 就把 Web 漏洞质变为系统后门。
+    **②IPC 桥接的天真信任**——渲染器不能随意写文件，必须经 IPC 向主进程请求。而主进程的 `ipcMain.handle` 监听器本质上是**暴露给不可信渲染器的无鉴权 RPC 接口**。渲染器被攻陷后伪造消息（如 `['save-file', {path: '../../Startup/trojan.exe'}]`），主进程若盲目信任同源传来的路径，隔离机制即宣告崩溃。
+    **③预加载脚本越权与污染**——`preload.js` 是开发者放的中间人。找**过度放权的 API**：暴露了 `openExternal(url)` 就能传 `file:///C:/Windows/System32/cmd.exe` 唤起系统进程。若漏配 `contextIsolation`，preload 与页面的 V8 环境共享 → 用前端的**原型链污染**篡改 preload 依赖的方法，完成隐蔽的沙箱逃逸。
+    **④领航权的劫持**——`will-navigate` 或新窗口创建若未做强校验，可把主渲染视图导航到攻击者站点；若框架没剥离新域名在该视图下的特权，攻击者网页就**继承官方界面的全部高权限通道**。
+    **⑤协议处理引擎的隐形大门**——应用向 OS 注册自定义伪协议（`myapp://`）。**0-Click 攻击面**：用户访问含 `<iframe src="myapp://exec?cmd=...">` 的网页，浏览器后台唤醒应用；若启动代码把命令参数未经清洗送进 `exec`，即无感知 RCE。
+    **⑥供应链更新的换心手术**——自动更新端点至关重要：若 AutoUpdater 走不安全网络、或只比对从同一未受保护服务器下载的 yaml/sha512，而不做本地强公钥签名校验（Ed25519 / 平台 CodeSign），就是完美的投毒下发口。
+  criteria: 成立=能指出渲染层到宿主层之间**具体的越权通道**（IPC 监听器 / preload API / 导航 / 伪协议 / 更新端点），并给出从 Web 输入到宿主动作的路径。失效=把它当纯 Web 应用（只找 XSS）或当纯二进制（只找内存破坏）。
+  tags: whitebox, desktop, electron, tauri, cef, ipc, preload, context-isolation, prototype-pollution, custom-protocol, autoupdater, 桌面应用, 混合架构, 上下文隔离, 原型链污染, 自定义协议, 自动更新
+  reviewer: j0hnexp
+
+# ══════════ B 段补遗 · 编排与链条 ══════════
+
+- title: 文件写 → 配置毒化 → 持久化后门（多跳编排模板）
+  kind: technique
+  domain: redteam
+  provenance: user
+  applicability: 手上只有一个"任意文件写"级别的弱点，需要评估能否升级为代码执行或持久化时。前置：目标存在"配置文件驱动行为"的映射，或从可写目录加载代码。关键词：文件写升级 / file write to rce / 配置毒化 / config poisoning / 持久化 / persistence / 后门 / 符号链接竞争。
+  content: |
+    **升级路径矩阵**（初始能力 → 目标能力 / 路径 / 依赖条件）：
+    · 任意文件写 → **代码执行**：覆盖客户端自身的 `.py` / `.so` / `.dll` —— 依赖"客户端从可写目录加载代码"
+    · 任意文件写 → **代码执行**：写 `~/.bashrc` / `~/.zshrc` —— 依赖"用户下次打开 shell"
+    · 任意文件写 → **持久化后门**：写 `/etc/cron.d/` 或 systemd user service —— 依赖"有可写系统目录（容器/弱权限）"
+    · 任意文件写 → **配置篡改 → RCE**：改客户端配置注入恶意插件路径 —— 依赖"客户端重启或热重载配置"
+    · 任意文件写 → **条件竞争**：写临时文件后替换符号链接 —— 依赖"客户端使用可预测的临时文件名"
+    **五阶段模板**（`FILE_WRITE_TO_PERSISTENCE`）：
+    ①`initial_access`——能力 = 任意文件写；条件 = 客户端把服务端响应字段用于本地文件路径与内容。
+    ②`config_poisoning`——写入 `~/.myapp/config.yaml`，注入恶意 `plugin_dir` 与 `update_url`；前置 = 配置格式支持代码执行路径。
+    ③`trigger`——等客户端重启 / 配置重载 / 定时任务（时间窗 = 下次启动或配置里的 `check_interval`）。
+    ④`persistence`——恶意插件被加载 / 恶意更新被安装 / 后门命令执行。
+    ⑤**痕迹清理**——恢复配置文件为原始内容，把恶意操作伪装成正常更新日志。
+    要点：这条链的价值在于**把"只能写文件"这种看起来无用的能力，通过目标自身的加载机制放大为代码执行**——先去读目标"什么配置驱动什么行为"，再决定写哪个文件。
+  criteria: 成立=能指出"写哪个文件 → 由哪个加载/触发机制消费 → 何时生效"，并给出触发时间窗。失效=只证明"能写文件"就收工；或写的文件不在任何加载路径上（无法被消费）。
+  tags: redteam, file-write-to-rce, config-poisoning, persistence, backdoor, symlink-race, loading-chain, 文件写升级, 配置毒化, 持久化, 后门, 加载链, 多跳编排
+  reviewer: j0hnexp
+
+- title: 低权限组件借力高权限守护进程——IPC 消息伪造提权
+  kind: technique
+  domain: redteam
+  provenance: user
+  applicability: 目标存在多进程架构（主进程 + 子进程 / 守护进程 / 插件加载器）且组件间通过 IPC 通信时。前置：能拿到 IPC 协议定义或监听侧源码。关键词：IPC / 提权 / privilege escalation / 守护进程 / daemon / dbus / socket / 消息伪造 / 无鉴权 RPC。
+  content: |
+    **discovery 三问**（先答这三个再谈利用）：
+    ①客户端是否存在多进程架构？
+    ②进程间通信用什么机制——socket / pipe / dbus / shared memory？
+    ③**高权限进程是否信任低权限进程的消息来源**？
+    **三阶段**：
+    ①`ipc_recon`——分析 IPC 协议格式，寻找可注入字段。
+    ②`message_forgery`——在低权限组件中构造恶意消息；**条件 = IPC 缺乏消息签名或来源验证**。
+    ③`privilege_leverage`——高权限守护进程执行消息中的指令。典型落点：创建系统级后门用户 / 修改防火墙规则放行 C2 流量 / 读取其他用户的敏感文件。
+    判据一句话：**高权限进程信任低权限进程的消息、且无签名或来源验证 → 成立**。
+    可迁移性：这是"混淆代理（Confused Deputy）"的进程间版本，与 web 侧的 CSRF/SSRF 同宗——**被信任的一方替不可信的一方执行了动作**。找这类漏洞时先问"谁信任谁、信任有没有凭据支撑"。
+  criteria: 成立=能画出"低权限组件 → IPC 通道 → 高权限执行点"的路径，并证明该通道**没有来源验证或签名**。失效=只说"存在 IPC"而没证明高权进程会执行低权来源的消息；或通道已有签名/白名单校验。
+  tags: redteam, ipc, privilege-escalation, daemon, message-forgery, confused-deputy, multi-process, 提权, 守护进程, 消息伪造, 混淆代理, 进程间通信
+  reviewer: j0hnexp
+
+- title: 无界资源分配的渐进式危害——压缩炸弹的定量模型与整数截断
+  kind: technique
+  domain: binary
+  provenance: user
+  applicability: 目标"没有限制解压/分配大小"，需要把"就是个 DoS"量化成可信的危害评估时；或分配路径上存在 `size_t` → 窄整数的强制转换时。前置：能读到分配点与长度校验点。关键词：压缩炸弹 / zip bomb / 解压缩 / 资源耗竭 / DoS / 整数截断 / Z_STREAM_END / avail_in / OOM。
+  content: |
+    **定量模型**：设攻击者控制的压缩流大小 `|C|`、解压后 `|D|`、压缩比 `ρ = |D|/|C|`。DEFLATE 对高度可压缩数据（全零序列）的理论压缩比受 Lempel-Ziv 32KB 滑窗与 Huffman 极限约束。
+    算一遍就够：`|C| = 10MB`、`ρ = 1000` → `|D| ≈ 10GB`；客户端 2GB 内存、每次分配 16KB → 到 OOM 约 13 万次迭代，按 100MB/s 解压速度**数秒内触发**（实际因内存碎片更快）。**10MB 输入换 10GB 内存压力——压缩数据大小与危害完全不成比例**；容器环境只有 512MB 时更极端。
+    **渐进式危害三阶段**：
+    ①**内存压力累积**——每次分配 16KB，累计随迭代线性增长。
+    ②**系统级级联失效**——移动平台 OOM Killer 按 `oom_score` 选受害者：前台应用被杀，或后台守护进程触发 watchdog 重启循环，造成 CPU/内存周期性抖动。
+    ③**复合拒绝服务**——若客户端有指数退避重试，攻击者周期性发送即可让它陷入"请求 → OOM → 重启 → 重试 → 再 OOM"。攻击带宽需求极低：每 `T` 秒发一个 10MB 请求即可维持持续性 DoS。
+    **整数截断的独立风险**（这条常被忽略，且与"DoS"无关）：`static_cast<uInt>(inDataSize)` 把 64 位 `size_t` 截断成 32 位只留低 32 位——5GB 变 1GB。zlib 处理完截断后的 1GB 就返回 `Z_STREAM_END`，**但输入流还有 4GB 未消费**。客户端若不检查 `avail_in` 残留，会误判"解压缩完成"，把**截断后的不完整数据**交给上层解析器；对 JSON 解析器来说截断可能落在字符串或对象中间，触发解析异常甚至进入未处理的错误分支。
+  criteria: 成立=给出 `|C|`/`ρ`/迭代次数/耗时四个量，并明确危害阶段与判据（RSS 单调增长 + OOM 触发）；若存在窄化截断，还要给出残留量并说明上层如何误判。失效=只说"这是个压缩炸弹"而不给量化；或忽略 `avail_in` 残留只谈 OOM。
+  tags: binary, zip-bomb, decompression, resource-exhaustion, dos, integer-truncation, avail-in, z-stream-end, oom, 压缩炸弹, 解压缩, 资源耗竭, 整数截断, 拒绝服务, 定量模型
+  reviewer: j0hnexp
+
+- title: 两端验证法——链条首尾闭合即可判定，中间环节往往是黑盒
+  kind: technique
+  domain: ai-security
+  provenance: user
+  applicability: 验证一个"经过中间组件（LLM / 解析器 / 代理 / 模板引擎）"的利用链时，不必也不应去实测中间组件的行为。前置：能审计两端的源码。关键词：两端验证 / two-end validation / 首端 / 末端 / 黑盒桥梁 / injection / 工具注入 / 语义净化 / HITL。
+  content: |
+    核心洞察：**不要验证中间组件"会不会被骗"，验证的是"欺骗的路径是否畅通"**。若两端都闭合，中间只是一个**黑盒桥梁**——只要有足够好的绕过技术即可打通。
+    **首端（注入必成）**——从外部数据源到中间组件上下文的**污点追踪**三问：①定位污点源（用户输入 / 上传文件 / 第三方 API / 网页抓取 / 邮件）；②追踪传播——是否经过**语义净化**？（黑名单过滤可绕，语义净化/结构化隔离更硬；数据进入前的最后一步是否仍保留完整语义）；③确认汇聚——是否最终进入执行入口，且与系统指令之间**无有效隔离**？
+    **末端（执行必达）**——**暂时忽略中间组件**，假设攻击者已控制参数生成，直接审计末端工具的底层实现：路径是否规范化/有目录穿越防御？内容是否过滤？是否 `shell=True` 或参数未转义？查询是否参数化？是否有收件人白名单？调用前是否有 HITL（`auto_approve=True` 等于没有）？
+    **三条常见陷阱**：①不要验证"组件是否聪明"（那是能力问题，不是安全问题）；②**"有防御" ≠ "防御有效"**——黑名单过滤、提示词禁令都是可绕的；③不要忽略组合效应（单个工具安全，多个工具组合可能危险：先读再写再执行）。
+    判据：两端各问"是否**无**有效防御"；两端皆闭合即判定利用链完整，不必实测中间环节。
+  criteria: 成立=两端各自给出"污点源→汇聚"与"参数→执行"的闭合证据，且明确说明中间的隔离/防御**为何无效**。失效=去实测中间组件的行为（浪费且不可靠）；或因为"中间有防御"就放弃，未证明防御可绕。
+  tags: ai-security, two-end-validation, taint-tracing, injection, tool-call-injection, semantic-sanitization, hitl, confused-deputy, 两端验证, 污点追踪, 注入, 工具调用, 语义净化, 沙箱
+  reviewer: j0hnexp

@@ -1,0 +1,229 @@
+# ZhiShi 专家知识导入 — 白盒审计与利用链分析
+# 用法：zhishi expert import egym-set/expert/whitebox-chain.yaml --reviewer j0hnexp
+# 来源：E:\code\kimiSec\zerodayFind（huntzero / kimiSec）——
+#   new/skills/cerebrum/references/cognitive-framework.md、skills/ai-agent/references/*、
+#   skills/foundation-lib/references/code-understander.md、skills/binary/references/*、
+#   skills/counter/references/orchestrator.md、.bots.md、README.md、
+#   当我们用AI挖到第一个高危——假设驱动认知审计实战.md、1.md（实机推理轨迹）
+# 注意：导入不去重，同一文件只导一次；重复了用 zhishi expert rm 清理。
+#
+# 【检索纪律】search 只返回 ≤5 条，稳定命中的是 title / applicability / tags；
+#   中文长复合词常捞不出来。故关键词在 title + applicability + tags 三处重复，tags 中英双给。
+#
+# 补的两块空白：**白盒审计**（A 段，源码级审计的认知流程与判据）
+#              **利用链分析**（B 段，从可控点到代码执行的链式证明）
+
+# ══════════ A 段 · 白盒审计 ══════════
+
+- title: 白盒审计的假设驱动认知五层模型（HDCA）
+  kind: sop
+  domain: whitebox
+  provenance: user
+  applicability: 开始白盒审计一个陌生代码库时，作为**全程认知骨架**用——先建模型再找洞，而不是打开文件就追调用链。前置：能读源码与架构文档（README / 构建系统 / 配置模板）。关键词：白盒审计 / 源码审计 / 假设驱动 / HDCA / 认知分层。
+  content: |
+    核心转换：把审计从**规则匹配**升级为**科学假设的生成与证伪**。规则匹配（无论人工直觉还是 SAST 签名）只能发现"已经知道该找的东西"。
+    五层递进：
+    **Layer 1 深度理解**——先建心智模型：目的识别、信任边界映射、数据流追踪、Invariant 识别。产出是**攻击面热力图**（哪些模块处理不可信输入且缺纵深防御）。反模式：打开文件就追函数调用、看到 `eval` 就写报告、不读文档就挖。
+    **Layer 2 对抗共情**——模拟开发者，找"过度自信 = 盲区"的区域：信心高 + 安全控制少 = 重点挖掘。可检索信号：`TODO: validate later`（极高）、`FIXME`/`HACK`/`this should never happen`（高）、无错误处理（高）、过度错误处理（中）。
+    **Layer 3 溯因推理**——从异常反推，而非从规则出发。异常类型与追问：函数名与行为矛盾（调用方是否基于函数名的承诺做了安全假设）、类型不匹配（中间态可否利用）、不对称安全检查（被检查与未检查的路径是否来自同一不可信源）、注释与代码矛盾、双 parser 场景（对同一数据的解释差异可否武器化）。
+    **Layer 4 认识论谦逊**——列出当前 5 个最强假设，各设计一个"若假设错误就会成功"的测试；**意外成功的测试 = 模型与现实的裂缝**。
+    **Layer 5 远距类比**——把漏洞当**结构模式**而非技术细节：Parser Differential / TOCTOU / Confused Deputy / Serialization Gap / Cache Poisoning / Path Confusion / Race Window。
+    时间分配：小项目（<100 文件）1-2 轮；中型（100-1000）2-4 轮；大型按模块分解，各 2-3 轮。
+    实证：一次 HTTP 客户端库审计，Layer 2 推出的"平台分支忽略 bufferSize"假设 → 确认 Windows 走 `memcpy_s`、`#else` 分支走裸 `memcpy` → 高危内存安全问题，38 分钟内定位。
+  criteria: 成立=五层各有产出物（信任边界图 / 数据流 / Invariant 清单 / 盲区信号清单 / 异常追问记录 / 自我挑战测试结果），且假设带可证伪表述。失效=直接从 Layer 3 开始（上手就追调用链）；或只做 Layer 1 就下结论；或没做 Layer 4（无任何自我挑战测试）。
+  tags: whitebox, hypothesis-driven, hdca, cognitive-model, trust-boundary, invariant, abductive-reasoning, adversarial-empathy, 白盒审计, 源码审计, 假设驱动, 认知分层, 信任边界, 溯因推理, 对抗共情
+  reviewer: j0hnexp
+
+- title: 可证伪安全假设三元组——CLAIM / FALSIFICATION / CONFIDENCE
+  kind: idea
+  domain: whitebox
+  provenance: user
+  applicability: 把模糊的"这里有没有洞"改写成可独立验证的命题时；多人/多 agent 复核同一组证据时的表达规范。前置：无，开题即可用。关键词：可证伪 / 假设表述 / 置信度 / falsifiable hypothesis / 假设三元组。
+  content: |
+    问题：传统审计问"这里有没有漏洞？"——太模糊，**既不能被验证也不能被排除**。
+    改写为三元组：
+    **CLAIM**：一个明确的、可测试的安全声明。
+    **FALSIFICATION**：什么证据可以推翻这个声明（必须能具体到代码结构或可执行测试）。
+    **CONFIDENCE**：基于当前证据的置信度 0-1。
+    示例：CLAIM = 函数 `DecompressResponse()` 处理恶意构造的 gzip 数据时无限制分配内存，导致 OOM；FALSIFICATION = 若代码中存在可配置的总输出大小上限、且在分配前被校验，则假设不成立；CONFIDENCE = 0.55（代码结构初判，尚未验证调用链）。
+    价值：把模糊的安全直觉转化为**可被独立验证的命题**——多个验证者可基于同一组证据独立评估真伪。这是对抗性复核能成立的前提（见「对抗性验证两条闸」条）。工程实现里假设对象就是 `claim / target / falsification / confidence` 四个字段。
+  criteria: 成立=每条假设都写出具体的 falsification 条件（能指向代码结构或可执行测试），且置信度可被新证据更新。失效=假设写成"可能存在风险"这类无法证伪的表述；或 falsification 写成"如果没有防御"这种同义反复。
+  tags: whitebox, falsifiable-hypothesis, claim-falsification-confidence, hypothesis, confidence, 可证伪, 假设表述, 置信度, 假设三元组
+  reviewer: j0hnexp
+
+- title: 对抗性验证两条闸——三维筛 + 批判者
+  kind: sop
+  domain: whitebox
+  provenance: user
+  applicability: 假设池已生成、需要降噪时；单一验证者的结论需要独立复核时。前置：假设已按三元组表述。关键词：对抗性验证 / 三维筛 / 可达性 / 可利用性 / 缓解性 / devil's advocate / 降噪。
+  content: |
+    **第一闸·结构化三维筛**。每个假设必须独立回答三问：
+    · **可达性**——外部/未认证用户能否到达此代码路径？排除仅内部调用的"伪漏洞"。
+    · **可利用性**——能否用**现实输入**触发异常行为？排除理论存在但无法构造的缺陷。
+    · **缓解性**——是否存在**上游**防御阻断利用链？排除已被纵深防御覆盖的问题。
+    三维都指向"风险存在"才进候选池。实测这一闸过滤约 **40%** 的初始假设。
+    **第二闸·批判者（Devil's Advocate）**。对过关的假设派一个独立批判者，其唯一任务是**从反面推翻**它，主动去找：调用方是否已做前置校验？是否存在编译期或运行期的隐性保护？攻击路径里有没有被忽略的边界条件？
+    批判者找到的反驳，作为**负面证据回注置信度**：反驳成立 → 假设降级或丢弃；反驳被证伪 → 置信度进一步提升。
+    配套置信度阈值：**0.90+ CONFIRMED**（多源交叉验证且批判者未推翻）/ **0.70-0.89 LIKELY**（有证据但有未验分支）/ **0.40-0.69 UNCERTAIN**（结构可疑、缺决定性证据）/ **<0.40 DISCARDED**（负面证据占优或已证伪）。
+    注意：置信度 ≠ 严重性，两者分开记。
+  criteria: 成立=每个候选假设都留下三维筛记录与批判者的反驳记录（含"反驳被证伪"的理由），且最终置信度落在明确档位。失效=只有一个验证者下结论；三维筛只填"是/否"而无具体证据；或没派批判者（无负面证据回注）。
+  tags: whitebox, adversarial-validation, devils-advocate, reachability, exploitability, mitigation, triage, confidence, 对抗性验证, 三维筛, 可达性, 可利用性, 缓解性, 批判者, 降噪
+  reviewer: j0hnexp
+
+- title: 每轮推理的三段认知触发——假设审计 / 异常反思 / 自我证伪
+  kind: technique
+  domain: whitebox
+  provenance: user
+  applicability: 任何多轮审计/挖掘流程中，给每一轮推理加固定自省动作。前置：推理过程有结构化的 thinking 记录位。关键词：假设审计 / 异常反思 / 自我证伪 / assumption audit / self-falsification / 自省。
+  content: |
+    三段固定自问，写在每轮推理的思考段里：
+    **①ASSUMPTION AUDIT（假设审计）**：我刚才**默默假定了什么**？把它写出来，并判断这是"证据"还是"习惯"。
+    实证：某轮默认"这些 batch 文件不可达"，自省后判定这是**习惯而非证据**——Ghostscript 包装脚本在服务端文档处理管线（网页上传、邮件附件、打印服务器）里被持续调用，"不可达"对真实部署是危险错误。
+    **②ANOMALY REFLECTION（异常反思）**：有什么看起来**古怪而脆弱**的东西值得放大？
+    实证：`echo %1 >> "%TEMP%\_.at"` 这种临时文件拼接写法反常 → 追问出 write-then-read 之间的 TOCTOU 竞争窗口，以及 `%~1` 会**剥掉引号**（与安全处理相反）。
+    **③SELF-FALSIFICATION（自我证伪）**：要**推翻**当前最高置信假设，需要什么证据？这个证据存不存在？
+    实证："要证伪命令注入假设，需证明 Windows batch 会对未加引号的 `%1` 展开转义 `&`/`|`/`>`——这不可能，那是 batch 解析的基本行为" ⇒ 假设因此被**加固**而非被动接受。
+    三段各自防一种错误：①防"习惯当证据"（最常见的错误来源），②强制放大怀疑点，③把假设从"没人反驳"升级为"反驳过但站得住"。
+  criteria: 成立=每轮思考里三段都有具体内容（写得出被默许的假设、说得出反常点、给得出证伪条件）。失效=三段写成空话（"暂无异常"）；或只做第③段而跳过①，漏掉"习惯当证据"这类错误。
+  tags: whitebox, assumption-audit, anomaly-reflection, self-falsification, metacognition, 假设审计, 异常反思, 自我证伪, 自省, 认知触发
+  reviewer: j0hnexp
+
+- title: 隐式契约显式化——底层库审计的主线
+  kind: technique
+  domain: whitebox
+  provenance: user
+  applicability: 审计基础库/底层代码（编解码、解析、内存管理、FFI 胶水）时。前置：能读 C/C++/Rust 源码。关键词：隐式契约 / implicit contract / unsafe / 指针运算 / 生命周期 / FFI / 越界 / 基础库审计。
+  content: |
+    命题：所有高效的基础库都靠**没写下来的契约**运作——"调用者保证缓冲区够大""这个指针在函数返回前有效""输入以 NUL 结尾"。审计的任务是把每条隐式契约**显式化**，再追问一句：**如果这条契约为假，会发生什么？**
+    C/C++ 里假契约 → UB；Rust `unsafe` 里假契约 → 编译器已优化掉的安全检查被实际绕过。
+    视觉触发器（读到就亮灯）：
+    · `unsafe { … }` 块出现频率——每块都是一份"调用者已保证前置条件"的声明；位于公共函数深处而外层未校验 = 定时炸弹
+    · 指针运算密度：`ptr + offset`、`*(ptr+i)`、`*((T*)raw_bytes)`——每行都在假设布局/对齐/生命周期
+    · 循环终止条件依赖输入：`while (*p != '\0')`、`for (i=0; i<hdr.len; i++)`——`p` 无终止符或 `hdr.len` 被伪造就是无底洞
+    · 分配路径上的 `goto` 或错误处理不完整——错误分支漏释放、成功分支重复释放
+    · FFI 类型转换：`C.String → *C.char`、`uintptr_t → unsafe.Pointer`——类型系统保护被抹掉
+    · `#[repr(C)]`/`packed` 结构体——手动布局，编译器不再保证对齐（x86 只是慢，ARM 直接 SIGBUS）
+    不可跳过的六问：①这个 unsafe 块里哪些指针被解引用、生命周期由谁保证？②循环终止条件是否完全由**可信**数据控制？③这个函数有几条分配路径、每条是否都有对应释放？④指针运算里有没有整数溢出（`base + offset*sizeof(T)` 且 offset 极大 → 回绕到低地址）？⑤FFI 结构体布局与 C 侧是否完全一致（新增字段或对齐差异 → 字段错位、静默数据损坏）？⑥有没有"借用/零拷贝"语义（返回的切片是否依附于可能已被修改或释放的内部缓冲）？
+    完整逻辑链示例：`fn parse_header(buf: &[u8]) -> &str` 内部 `from_utf8_unchecked(buf)` → 隐式契约"buf 恒为合法 UTF-8" → 攻击者传入含 `0xFF` 的 buf → 产出非法 `&str` → 下游按 UTF-8 处理的函数行为未定义。
+  criteria: 成立=能对每个可疑点输出「文件:行 / 代码模式 / 隐式契约 / 破坏方式 / 后果」五元组。失效=只说"这里用了 memcpy 可能溢出"而说不出**被违反的那条契约**是什么；或只列危险函数、不追问前置条件。
+  tags: whitebox, implicit-contract, unsafe, pointer-arithmetic, loop-invariant, lifetime, ffi, foundation-lib, 隐式契约, 指针运算, 生命周期, 越界, 基础库审计
+  reviewer: j0hnexp
+
+- title: 第一性原理三公理——不用漏洞清单找洞
+  kind: idea
+  domain: whitebox
+  provenance: user
+  applicability: 开题时确定"以什么为准绳找洞"；目标没有已知漏洞清单可对照时；避免被清单思维限制覆盖面。前置：无。关键词：第一性原理 / first principles / 不变量 / invariant / 状态机 / 三公理。
+  content: |
+    立场：**不使用预定义的漏洞分类清单，不依赖历史经验的"检查项"**，仅凭第一性原理推导。
+    核心公理：一切系统皆可被描述为——一组**状态**（某时刻的完整快照）、一组**转换**（输入驱动下状态如何变化）、一组**约束/不变量 Invariant**（系统承诺"永远成立"的属性）。
+    **唯一目标：找到一个输入序列或操作序列，使某个 Invariant 被违反。**
+    由此只找三类异常，不依赖漏洞清单：
+    · **逻辑矛盾**——同一事实被系统以两种互斥方式断言（注释 vs 代码、两个组件对同一数据的定义不一致）。
+    · **状态异常**——存在一个可达状态，其不变量不成立（如"已释放但仍被引用"）。
+    · **越界资源访问**——对资源的访问超出声明边界（数组/缓冲区/生命周期/权限域）。
+    配套导航纪律（双通道）：**探索通道**（grep/find，快、语言无关、能抓注释与字符串里的人类线索）用来**发现可疑点**；**验证通道**（AST 级调用图与函数体查询）用来构建**无噪音的数据流链**。原则是「先用探索通道发现可疑点，再用验证通道证明攻击链」——不要用 grep 去证明完整调用链（噪音太多），也不要用 AST 做全局扫描（慢且语言受限）。
+  criteria: 成立=能明确写出目标系统的状态/转换/不变量三要素，并把每个候选漏洞归入三异常之一。失效=上来就按漏洞清单或危险函数签名扫；或说不出违反的是哪条不变量。
+  tags: whitebox, first-principles, invariant, state-machine, class-agnostic, dual-channel-navigation, 第一性原理, 不变量, 三公理, 状态机, 探索通道, 验证通道
+  reviewer: j0hnexp
+
+# ══════════ B 段 · 利用链分析 ══════════
+
+- title: 利用链就是最短的桥——污点源到高权限汇点
+  kind: technique
+  domain: redteam
+  provenance: user
+  applicability: 已发现一个可控点但不确定它能到哪；或需要把"某种影响"升级为代码执行/持久化时。前置：能追踪数据流（源码或 AST 级调用图）。关键词：利用链 / exploit chain / 污点源 / source / sink / 最短路径 / 数据流。
+  content: |
+    形式化：**每个漏洞都是一条桥——一端是攻击者可控的数据源（Source），另一端是高权限执行入口（Sink）。任务是找最短的那条桥。**
+    输出强制逐跳数据流，五段：
+    **①攻击源**——攻击者控制的具体数据源（用户输入 / 上传文件 / 检索结果 / 第三方 API 返回 / 网页抓取 / 邮件）。
+    **②传播路径**——数据如何进入系统内部。每一跳都要问"这里有没有拦截"，并记住 **有拦截 ≠ 有效拦截**（黑名单可绕，白名单更硬）。
+    **③注意力/信任劫持**——若链路中途经过一个"会基于内容做决策"的组件（LLM、解析器、模板引擎），要证明该组件**上下文结构上的缺陷**，而不是假设它会被骗。
+    **④触发**——被劫持的组件生成的**具体**下一步动作。不能只说"可能执行命令"，要给出具体参数。
+    **⑤执行结果**——末端是否有最后防线。记住 **有沙箱 ≠ 有效沙箱**。
+    闭合条件：可控源 + 传播无有效拦截 + 末端无有效防线。
+    捷径提示：最短桥 = 优先找**直接拼接**、**信任委托链短**、**末端权限高**的组合；链条越长，单点失效越多（见「多跳利用链编排」条）。
+  criteria: 成立=能画出从 Source 到 Sink 的逐跳路径，且每一跳都标注了拦截/防线及其**是否有效**的判定。失效=只给出"存在风险"而没有逐跳路径；或用"可能/或许"描述中间环节（说明那一跳没验证）。
+  tags: redteam, exploit-chain, source-to-sink, taint-analysis, dataflow, shortest-path, 利用链, 污点源, 汇点, 数据流, 最短桥
+  reviewer: j0hnexp
+
+- title: 六段式证明链——把"存在风险"升级为"无可辩驳"
+  kind: technique
+  domain: redteam
+  provenance: user
+  applicability: 要交付一份让人无法反驳的漏洞证明（写报告、过评审、反驳"理论上存在"的质疑）时。前置：已有候选利用链。关键词：证明链 / claim chain / 六段式 / proof / 证据闭合 / 无可辩驳。
+  content: |
+    证明链必须**环环闭合**，六段，缺一不可：
+    `Source → Propagation → Hijacking → Trigger → Execution → Impact`
+    每段的证明要求与常见陷阱：
+    · **Source**——攻击者能否控制这个数据源？陷阱：「需要用户上传」不等于安全，社工可绕过。
+    · **Propagation**——数据进入系统时是否有拦截？陷阱：**有拦截 ≠ 有效拦截**。
+    · **Hijacking**——中间组件是否会被外部数据影响？陷阱：不能假设组件行为，要证明**上下文结构缺陷**。
+    · **Trigger**——会生成什么**具体**动作？陷阱：不能只说"可能执行命令"，要给出具体参数。
+    · **Execution**——末端是否有最后防线？陷阱：**有沙箱 ≠ 有效沙箱**。
+    · **Impact**——最终影响是什么？陷阱：必须量化（读文件？命令执行？数据外泄？改动落盘？）。
+    两个提升说服力的手法：
+    · **前瞻性可视化**——给出"注入前 vs 注入后"的对照，证明中间环节真的被淹没/覆盖，而不是靠断言。
+    · **参数对比**——把"用户看到的确认界面描述"与"实际执行的动作参数"并排放，两者的落差本身就是证据。
+    产出的不是"证明这个系统有漏洞"，而是"**证明这条利用链完全闭合，没有任何环节可以阻止攻击**"。
+  criteria: 成立=六段各自给出证据，其中 Propagation 与 Execution 两段明确判定"拦截/防线**是否有效**"而非"是否存在"。失效=任一段用"可能/或许"带过；或把"存在防御"直接当成"利用不成立"；或 Impact 未量化。
+  tags: redteam, claim-chain, proof-chain, six-stage, evidence-closure, 证明链, 六段式, 证据闭合, 无可辩驳, 利用链证明
+  reviewer: j0hnexp
+
+- title: 多跳利用链编排——把多个弱点串成完整攻陷
+  kind: sop
+  domain: redteam
+  provenance: user
+  applicability: 目标存在多组件交互 / 插件架构 / 信任委托链；或单个漏洞影响有限（如仅能文件写），需要评估能否升级到代码执行或持久化。前置：已发现 ≥2 个可利用点，或一个点但链路需要借力。关键词：编排 / orchestration / 多跳 / multi-hop / 持久化 / 单点失效 / 利用链编排 / 组件生态。
+  content: |
+    视角转换：目标不是单一体，而是由**解析器 + 文件系统 + 配置层 + 插件系统 + 进程树**组成的生态。攻击者控制一处后，用生态的**内部连接**自我放大。
+    触发信号（出现任一即启动编排视角）：多组件分层且数据经文件/管道/共享内存传递；存在"配置文件 → 代码行为"的映射；主进程 + 子进程/守护进程/插件加载器；临时文件或缓存参与流程。
+    必答的四个结构问题：
+    ①**跨组件信任边界**——组件 A 的漏洞能否影响组件 B 的信任边界？如何跨越隔离？
+    ②**写点与加载点错配**——文件写发生在 A，而 B 从该路径加载代码或配置？
+    ③**配置毒化**——配置篡改能否让组件在**下一次启动**时加载攻击者控制的资源？
+    ④**临时文件 → 竞争窗口**——临时文件写入/缓存污染能否被转化为 TOCTOU 条件竞争？
+    硬性输出要求：完整的**多跳路径图**；每跳的**触发条件与时间窗口**；**单点失效分析**（修复哪一跳会断链）；**检测规避思路**（如何在日志里隐藏多阶段痕迹）。
+    质量五维：**链完整性**（初始访问到最终目标 ≥3 跳，每跳条件明确）/ **稳定性**（不依赖极端时间窗口或用户特殊行为）/ **隐蔽性**（每阶段在正常业务逻辑掩护下执行）/ **修复弹性**（修复一跳后仍有 ≥1 条替代路径）/ **权限提升**（明确从高权限组件借力）。
+    自我校验：画了组件交互图吗？每跳触发条件可复现吗？有不依赖用户交互的自动触发路径吗？改动可恢复吗？容器/沙箱下链还成立吗？
+    本质一句话：**把目标的"复杂性"转化为攻击者的"杠杆"**——组件越多、交互越复杂、信任委托链越长，编排空间越大。
+  criteria: 成立=给出 ≥3 跳路径图，每跳标注触发条件与时间窗口，并完成单点失效与替代路径分析。失效=只罗列一堆漏洞而不给出串联路径；或链路只有 2 跳且存在单点依赖（说明只是罗列，还没编排）。
+  tags: redteam, orchestration, multi-hop, exploit-chain, persistence, single-point-of-failure, toctou, 编排, 多跳, 利用链编排, 持久化, 单点失效, 组件生态
+  reviewer: j0hnexp
+
+- title: 崩溃到代码执行——按安全机制组合选利用路线
+  kind: technique
+  domain: binary
+  provenance: user
+  applicability: 已有一个可触发崩溃的内存破坏点，需要从"崩"走到"执行"。前置：能拿到二进制与 libc、可本地复现、可调 gdb。关键词：ret2shellcode / ROP / ret2libc / GOT 覆写 / House of Spirit / 安全机制绕过 / NX / ASLR / Canary / PIE / 栈对齐。
+  content: |
+    三原则：①**尊重内存布局**——栈帧中缓冲区到返回地址的距离、堆块大小与对齐、GOT 与函数指针位置，必须精确匹配。②**绕过或转化安全机制**——NX → 用 ROP 而非 shellcode；ASLR → 先泄露地址；Canary → 先泄露 Canary 值，或找**不覆盖 Canary 的路径**。③**稳定优先**——不依赖特定内存布局、对输入长度限制友好、可重复触发。
+    按机制组合选路线（五种载荷）：
+    · **NX disabled** → **ret2shellcode**：`[NOP sled][shellcode][padding][shellcode 地址]`，偏移 = 缓冲区 + saved rbp + ret addr（64 位常见 72）。
+    · **NX enabled + ASLR/PIE disabled** → **ROP**：`pop rdi; ret` → 参数字符串（.bss/.data）→ `system@plt`。ROP chain 就是 `[gadget][arg][gadget][arg]…`，每个 gadget 以 ret 结尾续接控制流。
+    · **NX + ASLR enabled（PIE disabled）** → **ret2libc**：先泄露（如 `__libc_start_main+243`，glibc 2.35 偏移 0x29d90；或读 `puts@got`）算 libc 基址，再 `ret`（**栈对齐**）→ `pop rdi` → `/bin/sh` → `system`。偏移获取：本地 gdb 实测 / `readelf -s libc.so.6` / pwntools ELF 自动算。
+    · **格式化字符串** → **任意地址写**：先 `%p.%p.%p…` 定位置，再用 `%hhn` 逐字节写 GOT（如 `printf@got` → `system`）——**比 `%n` 更精确更稳**。
+    · **堆溢出可覆盖相邻 chunk 的 size** → **House of Spirit / fastbin attack**：溢出覆盖相邻 chunk 的 size 与 fd → free 它使其入 fastbin → 再分配同 size 拿回它（fd 已可控）→ 再分配一次即取到**目标地址** → 任意写。
+    收尾前检查清单：偏移算准了吗？有可靠泄露点吗？64 位 `system` 需要 16 字节栈对齐吗？目标过滤了 NULL/换行等字符吗？payload 超输入长度限制了吗？依赖特定堆布局吗（怎么提高稳定性）？需要分阶段（先泄露再打）吗？
+  criteria: 成立=能答出"这套机制组合（NX/ASLR/PIE/Canary/RELRO）对应哪条路线"，并给出偏移、泄露点、对齐处理三样。失效=NX 开启时仍走 shellcode；有 ASLR 却没泄露点就写死地址；或忽略栈对齐导致 `system` 崩在下游。
+  tags: binary, ret2shellcode, rop, ret2libc, got-overwrite, house-of-spirit, fastbin-attack, nx, aslr, canary, pie, stack-alignment, 利用构建, 安全机制绕过, 栈对齐, 栈溢出, 格式化字符串, 堆溢出
+  reviewer: j0hnexp
+
+- title: 二进制漏洞五维度定损——衡量"崩溃到 shell"的距离
+  kind: sop
+  domain: binary
+  provenance: user
+  applicability: 发现一个二进制漏洞后，判断值不值得投入、以及向决策者说明严重性时。前置：已知漏洞类型与触发条件，能跑 checksec。关键词：定损 / impact assessment / 严重性评级 / exploitability / reliability / 可行性评估 / 五维度。
+  content: |
+    前提认知：**发现 ≠ 可利用**。任务是衡量从"程序崩溃"到"获得 shell"之间那段距离——可能一步之遥，也可能是天堑。
+    五维度：
+    **①可利用性**——能否稳定利用取得代码执行？按机制组合分档：栈溢出无 Canary/NX/ASLR → Critical；有 Canary 或 NX → 需泄露或 ROP → High；堆溢出可覆盖元数据 / UAF 可控重用内容 → High；格式化字符串可任意读写 → Critical；整数溢出导致小分配大写入 → High；纯信息泄露 → Medium；仅 DoS → Low。
+    **②利用稳定性**——成功率与随机性：100% 稳定 → 不调整；>80% → -0.5；50-80% → -1；<50% → -1.5；仅理论可行 → -2。影响因素：ASLR（需泄露或爆破）、堆布局（需堆风水）、线程竞争（UAF 时间窗难控）、输入长度限制（短输入构造不出完整 ROP）。
+    **③权限提升潜力**——远程服务获 shell → 服务账户（Critical）；SUID 程序 → root（Critical）；内核驱动 → ring0（Critical+）；普通用户程序 → 无提升（Medium）；沙箱内 → 是否逃逸（High）。
+    **④攻击向量可达性**——远程无需认证 +1；远程需认证 不变；本地网络 -0.5；本地文件 -1；本地命令行 -1.5；物理访问 -2。
+    **⑤修复难度**——单点修复 -0.5；多点修复 不变；架构级重构 +0.5；依赖升级 +1；无法修复 +2。
+    输出模板必备三块：**安全机制表**（NX / ASLR / PIE / Canary / RELRO / FORTIFY_SOURCE 各状态 + 对利用的影响）；**五维度表**（评级 + 理由）；**综合定损**（严重等级 + 优先级 P0-P3 + 可利用性分级：可直接利用 / 需信息泄露 / 需复杂利用链 / 仅理论）。
+  criteria: 成立=五个维度各自给出评级与理由，且综合等级能由前五维推出（可复核）；安全机制表逐项填了状态与实际影响。失效=只按漏洞类型套模板给等级而不看机制组合；或漏掉稳定性/可达性这类调整项就直接下 P0。
+  tags: binary, impact-assessment, severity, exploitability, reliability, privilege-escalation, attack-vector, remediation, checksec, 定损, 严重性评级, 可行性评估, 五维度, 利用稳定性
+  reviewer: j0hnexp

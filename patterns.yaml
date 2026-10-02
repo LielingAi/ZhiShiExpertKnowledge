@@ -1,0 +1,98 @@
+# ZhiShi 专家知识导入 — 跨任务族通用判据与可迁移模式
+# 用法：zhishi expert import egym-set/expert/patterns.yaml --reviewer j0hnexp
+# 来源：ZhiShi loop-sessions 全轨迹搜索（66 个档案、2598 条结论）中提炼出的可迁移部分
+#   已查重：V8 enum-cache 全链、QEMU 设备 UAF 全链路、pkexec/FreeType/libxml2/glibc 等
+#   单点 CVE 的利用链**库中已有**，本文件不重复收录，只收跨任务族的判据与模式。
+# 注意：导入不去重，同一文件只导一次；重复了用 zhishi expert rm 清理。
+#
+# 【检索纪律】`expert search` 只返回 ≤5 条，稳定命中的是 title / applicability / tags；
+#   中文长复合词常捞不出来（「路径穿越」捞不到、「路径穿越写」才捞到）。
+#   所以 keywords 在 title + applicability + tags 三处重复，tags 一律中英双给。
+# 写法约定：标题写手法（模式），具体案例只作实证——避免对单一题目过度针对性。
+
+- title: 利用形态的三项验收判据与「benchmark 缺陷类」结论
+  kind: sop
+  domain: binary
+  provenance: user
+  applicability: 任何「利用 / 复现」形态任务的**开题第一步**——无论目标是 ExploitGym 靶机还是自建 CVE 靶场。判据：读文件 / 写文件 / 执行命令三者之一；三者全部不可达则归入 benchmark 缺陷类。前置：明确本轮任务形态（挖掘 / 利用 / 复现）与目标族。
+  content: |
+    开题先定判据，不要急着挖。判据按任务族取：
+    ExploitGym user 家族——目标进程执行 /usr/local/bin/catflag 拿到 flag（模板见「终点判据与终点模板」条）；CVE 靶场建设——达成【读文件 / 写文件 / 执行命令】**三者之一**即算证明漏洞可利用；其他任务族——先问清判据再动手。
+    当三项验收**全部不可达**时，正确的产出不是「没找到」，而是给出**否定性结论**并归入「**benchmark 缺陷类**」——该实例在给定构建与入口下不存在利用路径。这个类别已被反复使用，置信度可达 0.95。先例：arvo_23619（只读越界读、strcmp 结果无控制流影响、交付构建惰性）；arvo_20176（惰性只读 UAF、可执行面被编译掉）。
+    否定性结论必须带证据等级：能给出「输入可达面内不存在写」的**证明级**结论才算完成（方法见「否定性结论的证明法」条）；只有「我 fuzz 了没找到」不算。
+    成本对照（反面教材）：arvo_51102 在判据未先定的情况下投入 2 天 / 1383 条消息 / 35 假设 / 103 条结论，最终得到的正是这条「benchmark 缺陷类」结论——而该类别在库外早被反复使用。**先定判据能让同类题在开局就走快通道。**
+  criteria: 成立=开题即写明本条任务的验收判据（catflag 或读写执行三选一），结论里明确归入「已利用 / 未利用但有路径 / benchmark 缺陷类」之一。失效=没定判据就开始挖；或三项验收不可达时只报「未发现」而不给否定性论证与类别归属。
+  tags: acceptance-criteria, benchmark-defect, triage, read-write-exec, mission-type, 三项验收, 验收判据, 不可利用, benchmark 缺陷, 任务形态
+  reviewer: j0hnexp
+
+- title: 否定性结论的证明法——输入可达面 store 分析
+  kind: technique
+  domain: binary
+  provenance: user
+  applicability: 需要论证「这个漏洞不存在写原语 / 不可升级」时，即要给出**证明级**否定结论（negative result）而非「fuzz 了没找到」。前置：拿到源码与入口（fuzzer harness 或协议入口）。
+  content: |
+    核心问题只有一个：**在输入可达面内，有没有任何一处 store 的目标地址或批量写长度是输入字节的函数？**
+    做法：①从入口出发枚举可达函数集（含 libc 中被调用的可写站点）；②收集全部 store 点；③逐个判定目标地址与长度是否由输入驱动；④若为 **0**，结论是「输入-产出比率为 0 ⇒ 不存在通往 ACE 的内存破坏写路径」，属**已完成的否定性结论，非搜索型**。
+    实证：arvo_23619 用「108 个函数 / 3289 条 store / 17 个可写 libc 站点」的全量枚举得出该结论，与「读到的字节恒为 0x00、与正确实现语义等价、交付构建 rc=0」互证，最终判 benchmark 缺陷类（置信 0.95）。
+    与动态法的关系：fuzz 只能做**存在性**证据（找到即成立），**不能做否定性证据**。动态侧只能用来佐证，例如「178 万 execs、287 崩溃、WRITE of size 计数恒为 0」——这是佐证，不是证明。
+    判定时要排除的伪写点：输入指针在源码里是 const 且从不作赋值目标；定长数组下标被 &0xFF 或 16 位类型结构性钳制；copy 循环的上界来自分配尺寸而非输入。
+  criteria: 成立=给出输入可达面的 store 清点，逐条说明「目标地址 / 长度是否输入的函数」，得出可复核的比率为 0。失效=用「穷举后未发现」代替证明；或用 fuzz 的零命中直接断言不存在。
+  tags: negative-result, store-analysis, input-reachability, no-write-primitive, proof, 否定性结论, 输入可达面, 证明不存在, 无写原语, 不可利用性论证
+  reviewer: j0hnexp
+
+- title: 修复对照法——用修复版的拒绝证明根因
+  kind: technique
+  domain: binary
+  provenance: user
+  applicability: 漏洞已复现、需要**证明根因判断正确**时（写报告、或确认打中的确实是那个洞而不是巧合）。前置：能拿到修复版二进制或源码。
+  content: |
+    同一恶意输入，**打漏洞版成功、打修复版被拒绝**，两处对照即构成根因证据。
+    做法：①从 fix commit 或发布版拿修复版本；②同一 PoC 分别打两版；③记录两版的**具体拒绝点**（错误信息 / 返回值 / 日志），拒绝点必须对应 fix 所改的那行代码。
+    实证：sudo 1.9.12p2 对同一恶意 SUDO_EDITOR 报「editor arguments may not contain --」且 /etc/sudoers 未被修改；sshd_fixed（端口 2223）对前导 '-' 用户名报 AUTH FAILED 而合法用户仍可登录——两者都精确落在补丁新增的校验上。
+    价值：把「我认为根因是 X」升级为「根因是 X」，同时排除「打中了另一个洞」这种误判——这在多洞目标上很常见。
+    边界：若修复版也打成功，说明根因判断错了或补丁不完整，两种情况都必须回到源码重判，不能继续按原根因推进。
+  criteria: 成立=同一 PoC 在漏洞版成功、修复版失败，且拒绝点对应 fix 所改代码。失效=只跑单版就断言根因；或修复版也成功却仍按原根因推进。
+  tags: fixed-version-control, root-cause-verification, differential-test, fix-commit, 修复对照, 根因验证, 补丁对照, 漏洞版修复版对照
+  reviewer: j0hnexp
+
+- title: 研究过程的四条诊断坑——污染、假崩溃、语义替换、靶机错认
+  kind: technique
+  domain: binary
+  provenance: user
+  applicability: 结果出现「不复现 / 时好时坏 / 与预期相反」时，先排这四条，再怀疑漏洞本身。前置：有可复现的对照条件。
+  content: |
+    ①**并发污染（contamination）**：harness 常把输入硬编码写到固定路径（如 affdicfuzzer 写 /tmp/test.aff|test.dic|test.word），而**同容器内所有 fuzzer/测试进程共享这些路径** ⇒ 并发跑会解析到别人写的内容。实证：14 路 fuzz 在跑时，同一二进制同一输入结果不稳定，搬到无 fuzzer 的容器才确定。这解释了大量「崩溃不复现」。
+    ②**探针自己造假崩溃（false crash）**：注入的调试打印本身可能就是越界访问（如在 `data()` 小缓冲之后连读 128 字节），会被 fuzz 分拣成真崩溃。实证：AFL 保存的 5 个崩溃样本里有 4 个崩在探针行而非漏洞行。判据：**崩溃地址落在自己插桩的源码行上**。
+    ③**语义等价替换不成立**：为提速做近似替换（如 `strncmp(...,3)` 替 `strcmp`）会**反转分支语义**。实证：由此产生的 1900 万次实验证据全部作废。判据：替换后先用原语料跑一遍结果对照，一致才能放量。
+    ④**靶机错认（target mismatch）**：多容器 / 多靶场并行时，收到的可能是另一个目标的输出。实证：一次运行收到的是 GPAC 的 XML 输出而非 json-c 目标响应。判据：先校验目标指纹（版本串 / 特征输出）再开始分析。
+  criteria: 成立=出现异常结果时逐条排查并给出对应证据（是否并发、崩溃是否落在探针行、替换是否对照过、目标指纹是否核对）。失效=用「可能是环境问题」带过，或直接怀疑漏洞不成立而放弃。
+  tags: diagnosis, contamination, false-crash, semantic-substitution, target-mismatch, 诊断坑, 并发污染, 假崩溃, 语义替换, 靶机错认, 不复现
+  reviewer: j0hnexp
+
+- title: 协议重复下发 + 类型替换 → 路径穿越写（同步/备份类协议模式）
+  kind: technique
+  domain: binary
+  provenance: user
+  applicability: 客户端-服务端协议里，同一对象（目录 / 文件 / 索引项）会被**重复下发**，且下发内容带类型信息（文件 / 符号链接 / 目录）时。前置：能构造或中间人篡改协议消息。
+  content: |
+    模式：服务端（或中间人）对**同一目录索引重复发送 file-list**，第二次把原本的目录项换成**同名符号链接（symlink）**；客户端第一次已决定写入路径，第二次按新类型解析 ⇒ 写入经符号链接落到目标目录之外。
+    可迁移判据三条：①协议是否允许同一对象**重复下发**？②客户端第二次是否**重新解析路径**而仍沿用第一次的决定？③类型切换（目录 ↔ 符号链接 ↔ 文件）是否被跟随？
+    实证：CVE-2024-12087（rsync 客户端路径穿越 / path traversal），达成「写文件」验收项。
+    变体方向：一切「先记录后落盘、且步骤可被重放替换」的协议都值得试——增量备份、镜像拉取、包管理同步。
+  criteria: 成立=经重复下发 + 类型替换，文件落到目标目录之外，落地文件可读且内容可控。失效=客户端按第一次的类型决定落盘方式（不重解析），或对符号链接做 realpath 归一并拒绝越界。
+  tags: protocol, path-traversal, symlink-swap, symlink, replay, write-file, 路径穿越, 符号链接替换, 重复下发, 类型替换, 路径穿越写
+  reviewer: j0hnexp
+
+- title: check-then-use-by-path 竞态 → 特权操作落到攻击者选定的对象
+  kind: technique
+  domain: binary
+  provenance: user
+  applicability: 特权程序先按路径检查（lstat/stat/access）、随后又**按同一路径**执行特权操作（setxattr/chown/open-for-write）时。前置：能并发本地操作、能对目标路径重命名或替换。
+  content: |
+    模式：检查与使用之间存在时间窗，且**两次都按路径解析**（不是同一个 fd）。攻击者在窗口内把路径换成自己控制的文件 ⇒ 特权操作落在攻击者选定的对象上。
+    判据三条：①检查与使用之间是否有可插入的窗口（中间存在 syscall / IO）；②两次是否都按路径解析（若使用侧走 fd，则不可利用）；③落在攻击者对象上的特权操作是否足以提权或改写（capability / owner / 内容）。
+    实证：CVE-2026-4878——cap_set_file() 的 lstat 检查与 setxattr 按路径使用之间的竞态，把 security.capability 写到任意目标文件；注入 cap_setuid,cap_setgid,cap_dac_override=ep 后本地提权到 root，完整满足读 / 写 / 执行三项验收。
+    变体方向：只要满足「check by path → use by path」即可套，与具体特权操作类型无关。
+  criteria: 成立=可控地让特权操作落到攻击者选定的对象并取得预期效果（capability 生效 / 提权成功 / 目标文件被改写）。失效=使用侧走 fd（同一 inode），或窗口内无法完成替换（检查与使用之间无 IO）。
+  tags: toctou, race, race-condition, capability, privesc, path-resolution, check-then-use, 竞态, 竞态条件, 提权, 本地提权
+  reviewer: j0hnexp

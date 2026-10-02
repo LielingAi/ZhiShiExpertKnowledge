@@ -1,0 +1,125 @@
+# ZhiShi 专家知识导入 — 从轨迹里反推出的操作手法（行为层）
+# 用法：zhishi expert import egym-set/expert/trajectory-techniques.yaml --reviewer j0hnexp
+# 来源：zhishi auto-runs（34 个 CVE 复现研判的 env_exec 命令序列，1921 行）里**档案未记录**的行为层手法。
+#   档案只写结论，本文件写"他们实际怎么做的"——每条都带原始命令证据。
+# 注意：导入不去重，同一文件只导一次；重复了用 zhishi expert rm 清理。
+#
+# 【检索纪律】search 只返回 ≤5 条，稳定命中的是 title / applicability / tags；
+#   中文长复合词常捞不出来。故关键词在 title + applicability + tags 三处重复，tags 中英双给。
+
+- title: 受限写原语的三条破法——反选落点 / 读+写搬运 / 语法反解
+  kind: technique
+  domain: binary
+  provenance: user
+  applicability: 已拿到写原语，但**写出的字节集或写值本身受限**时——只能写数字串、只能写 normal double、无法写任意字节。前置：能算出写原语的可写字节集/可写值域。关键词：受限写原语 / constrained write / 反选落点 / 搬运指针 / read-write-compose / strtod 约束 / 规范地址。
+  content: |
+    核心思路：**先穷举出"可写字节集/可写值域"，再反过来在世界里找落点**——不要假设自己能写任意字节。
+    **破法 A·反选落点**——不控制写出的字节，而是把这些固定字节当作**目标地址的低位**，反选一个"能由这些字节构成"的可 mmap 低地址，再预先把 shellcode mmap 到那里。
+    实证（CVE-2021-3177，CPython `_ctypes` PyCArg_repr sprintf 栈溢出）：可写字节集 = `{0x30-0x39 数字, 0x2e '.', 0x29 ')', 0x3e '>', 0x00}`。写脚本枚举"数值长度 L → 返回地址落点"，取 L 使落点为规范地址 `0x3e2930303030`，`mmap(shellcode, 该地址)` 后 ret 跳过去执行。
+    关键动作：`find number-length L such that the overflow makes the return address a canonical, mmap-able low address we can pre-map with shellcode`。
+    **破法 B·读+写搬运**——用**同族的越界读**把堆上**已有的指针**原样搬到目标，而不是凭空构造指针。
+    实证（CVE-2021-40394，gerbv 孔径宏）：写值经 `strtod` 只能造 normal double（**指针位型是 subnormal，会被判 ERANGE 清零**，写不进指针）。但同处越界读写对 `lp[]` 同时可用——宏语句 `$W=$R` 即"读 `lp[R-1]` 8 字节 → 写 `lp[W-1]`"，把 `amacro->name`（=shellcode 地址）bit-exact 搬到 `puts@GOT`。
+    下标算法：`R = (src - base)//8 + 1`（读）、`W = (dst - base)//8 + 1`（写）——只要 base 固定就能算。
+    **破法 C·语法反解**——写值要过 atof/strtod/JSON 数字这类语法时，把目标字节翻译成"能被解析器原样还原的合法串"，并**显式验证 round-trip**：`struct.unpack('<d', struct.pack('<Q', a))`，打印是否 `roundtrip ok`，不一致就换值。
+    判据：成立=能明确写出"可写字节集/可写值域"的边界，并给出一个只使用该集合内的值就达成的落点或搬运路径。失效=假设能写任意字节、或写不进就断言"不可利用"。
+  criteria: 成立=能明确写出「可写字节集/可写值域」的边界，并给出一个**只使用该集合内的值**就达成的落点或搬运路径；且该路径在目标上实测跑通。失效=假设自己「能写任意字节」而不先穷举值域；或因写不进就断言不可利用。
+  tags: binary, constrained-write, constrained-bytes, find-landing-address, read-write-compose, bit-exact-copy, strtod-constraint, canonical-address, mmap-shellcode, 受限写原语, 反选落点, 搬运指针, 语法反解, 写值受限
+  reviewer: j0hnexp
+
+- title: verbatim 库级 PoC——环境跑不起目标时的第三条路
+  kind: technique
+  domain: binary
+  provenance: user
+  applicability: 漏洞在某个守护进程/服务里，但环境跑不起来（缺 CAP_SYS_ADMIN、禁 namespace、无 docker.sock），或端到端链路太长定位不到失败点时。前置：能拿到上游源码。关键词：verbatim / 库级 PoC / library-level poc / 环境阻塞 / 最小可执行面 / 真实函数复现 / blocker report。
+  content: |
+    做法：把**真实版本的漏洞函数**从上游源码里**逐字拷出来**（只改 package 名与日志 shim），编成最小可执行件，直接调它构造场景。
+    实证：
+    · CVE-2024-23652——`cp .../executor/stubs.go $BASE/poc/vuln/stubs.go`，源码里留注释 `# --- verbatim vulnerable stubs.go (package rename only) ---`；随后 `./poc-bin` 跑 `runScenario(..., vuln.MountStubsCleaner, true)`。
+    · CVE-2024-23651——把 `vendor/.../continuity/fs/path.go` 逐字拷成 `poc/fs/path.go`（sub() + RootPath）。
+    · CVE-2024-45310——直接 `go test` 调用真实 runc 1.1.13 的 `prepareBindMount`，得 **5249/30000 逃逸率**，1.1.14 修复版为 **0**。
+    **为什么它强于 surrogate**：跑的是**真实代码**（能说出是哪个文件哪个函数），不是自造的同类目标。因此它是"字面复现"与"surrogate"之间的独立一档。
+    配套：同时把**跑不起来的原因**固化成三段式证据，而不是文字断言——①宿主能力实测 `grep Cap /proc/self/status`；②失败命令原文 `unshare --mount --fork true`；③日志存档 `cp /tmp/bk-build.log evidence/03-build-failure.log`；最后合成 `03-environment-blocker.md`。
+    判据：成立=库级 PoC 逐字来自上游（可指名文件与函数）、跑出可量化差异（如逃逸率 vs 0）、且真环境的失败有可复核证据。失效=自造一个"类似"目标就称之为复现；或只说"环境不允许"而不给能力实测与失败日志。
+  criteria: 成立=库级 PoC **逐字来自上游**（可指名哪个文件、哪个函数）、跑出可量化差异（如逃逸率 vs 修复版的 0）、且真环境跑不起来的失败有可复核证据（能力实测 + 失败命令 + 日志）。失效=自造一个「类似」目标就称之为复现；或只说「环境不允许」而不给能力实测与失败日志。
+  tags: binary, verbatim-poc, library-level-poc, real-function-repro, environment-blocker, minimal-executable, blocker-report, capability-evidence, 库级 PoC, 逐字复用, 环境阻塞, 最小可执行面, 真实函数复现
+  reviewer: j0hnexp
+
+- title: 负对照纪律——版本 A/B + 跑前清痕 + 先证对照链
+  kind: sop
+  domain: whitebox
+  provenance: user
+  applicability: 任何要证明"这个洞成立/不成立"的场合；以及需要区分"真实复现"与"surrogate"、避免假阳性时。前置：能拿到受影响版本与修复版本（或能按补丁语义自造修复版）。关键词：负对照 / negative control / 版本 A-B / A-B test / 跑前清痕 / 假阳性 / 对照链校验 / 自造修复版 / worktree。
+  content: |
+    **① 版本 A/B**——同 payload、同脚本，**只换受影响版本 ↔ 修复版本**，差异必须落到磁盘产物/回显上。
+    实证：CVE-2021-40438（同一 SSRF payload 打 2.4.48 回显 FLAG、打 2.4.49 回落到合法后端）；CVE-2024-24576（对 Rust 1.77.1 与 1.77.2 各跑一遍 payload A–F + 基线）；CVE-2024-9287（3.12.6 触发、系统 3.12.3 已 backport 补丁不触发）。
+    **② 跑前清痕**——残留是假阳性第一大来源，每次跑之前先删产物与捕获目录。
+    实证：CVE-2024-24576 源码原注「每个 payload 跑之前都清掉对应痕迹文件，**避免 1.77.1 的残留误报 1.77.2**」；CVE-2021-3177 每次 `rm -f /tmp/pwned.txt`；CVE-2026-65084 `rm -rf $T/attacker-home/nemoclaw`（fresh state）。
+    **③ 先证明对照链真的链到对照库**——否则对照双方可能是同一个库。
+    实证：CVE-2021-40394 `ldd harness/harness_fix | grep gerbv`；`unset LD_LIBRARY_PATH` 后 `readelf -d harness/harness | grep -iE "rpath|runpath"`（确认无环境变量污染）。
+    **④ 自造修复版**——官方 fixed 拿不到时，**按补丁语义**给源码打补丁再重建（语义必须来自真实补丁，不能拍脑袋）。
+    实证：CVE-2021-40394 `cp -a gerbv-2.7.0 gerbv-2.7.0-fix`，给 PPUSH/PPOP 加边界检查后重建；CVE-2026-86060 用 `ROUTEROS_TRUSTED_CALLER=1` 做纵深防御版 login.c。
+    **⑤ 双版本源码并存**——`git worktree add ../repo-vuln <sha>; git worktree add ../repo-fixed <fixsha>`（或直接用 `<fixsha>~1` 取父提交）。一份 clone、同路径、可控版本，避免下载与路径漂移。
+    加固版本判定的独立佐证：`strings bin/runc-1.1.13 | grep -c "createIfNotExists"`、`go version -m bin/runc-1.1.13`、`readelf -d` —— 用它们证明"我打的确是那个版本"。
+  criteria: 成立=对照组双方版本可核（strings/go version/ldd/readelf 至少一种）、跑前有清痕动作、差异落在磁盘外部产物上、且对照后的结论标明"真实 vs surrogate"。失效=只跑单版本就下结论；对照双方其实是同一个库；或残留导致假阳性。
+  tags: whitebox, negative-control, ab-test, version-ab, clean-state, false-positive, environment-contamination, ldd-verify, self-patched-fixed, git-worktree, 负对照, 版本对照, 跑前清痕, 假阳性, 对照链校验
+  reviewer: j0hnexp
+
+- title: 根因定位的主入口是修复 diff，不是读源码
+  kind: sop
+  domain: whitebox
+  provenance: user
+  applicability: 审计一个**已知被修复**的漏洞时（有 CVE / OSV / GHSA 记录）。这是根因定位最短路径；也适用于"确认我打的是不是一个已被修掉的洞"。前置：能联网或已有补丁原文。关键词：修复 diff / patch diff / fix commit / git log -S / 回归测试当 PoC / compare API / 根因定位 / 补丁反推。
+  content: |
+    固定顺序：**外部权威数据 → 定位 fix commit → 读 diff 反推根因 → 才去读源码**。跳过第一步直接读源码，容易把"修复点"当成"根因点"。
+    **① 权威数据直接拉 API，不靠搜索摘要**：NVD / OSV / GHSA / CVE.org / 厂商公告（如 MSRC API 能给出 `exploited=Yes` / `publiclyDisclosed=No` / `cweList`）。
+    **② 定位 fix commit**：GitHub `commit/<sha>.patch`、`pull/<n>.diff`、GitLab `api/v4/.../repository/compare?from=vA&to=vB`、`<fixsha>~1` 取父提交；发布分支的 `CHANGES` 文件也能反查（`grep -n "40438" s-2.4.49/CHANGES`）。
+    **③ `git log -S` 按语义找改动**（不知道 commit 时）：`git log --all -S "Out of bounds drill number" --oneline -- src/drill.c` —— 用错误信息/常量/函数名当搜索键，比读 diff 快。
+    **④ 借回归测试当 PoC**（最省力的一步）：修复 commit 自带的回归测试输入，是**维护者已认可的最小触发器**。实证：`git show 672214ab:test/inputs/test-out-of-bounds-drill-tool.exc | cat -A` 直接取用。
+    **⑤ 若无法拿到公开 diff**：走二进制差分（`strings` 找新增符号、`bindiff` 找变化函数），但要意识到一次补丁常同修多个 CVE，**无法把某个函数改动唯一归因**——此时必须显式标注"未能唯一归因"。
+  criteria: 成立=能引用到具体 fix commit 与其改动的具体行，且根因判断与 diff 落在同一函数；若用了回归测试输入，能给出其来源 commit。失效=只读源码猜根因而不看 diff；或在多 CVE 同一补丁的情况下宣称唯一归因。
+  tags: whitebox, patch-diff, fix-commit, git-log-S, regression-test-as-poc, compare-api, root-cause, binary-diff, 修复 diff, 补丁反推, 回归测试, 根因定位, 唯一归因
+  reviewer: j0hnexp
+
+- title: 判据锚磁盘 + 换身份复核 + 退出码陷阱
+  kind: sop
+  domain: whitebox
+  provenance: user
+  applicability: 任何要把"成功/失败"写成结论的场合——尤其判词直接取决于"文件是否生成""端口是否回显"时。前置：无，全程适用。关键词：判据锚点 / evidence anchor / 独立复核 / 退出码 / exit code 陷阱 / tee / 可复现 / 产物落盘规范。
+  content: |
+    **① 判据锚在磁盘外部产物上，不锚在自报**——只认"文件是否生成 / 端口是否回显 / 内容是否匹配"，不认脚本打印的"success"。
+    **② 换身份或换视角复核**——容器内写完，**从宿主机侧**再 `ls` 一次；或换一个进程去读。实证：CVE-2026-60004 完成后从容器宿主侧复核产物落盘；CVE-2021-3177 把 `/tmp/pwned.txt` 拷出来独立查看。
+    **③ 退出码陷阱（会直接污染判词）**：`cmd | tee log` 之后 `$?` 是 **tee 的**退出码，不是 cmd 的。正确写法：`cmd; rc=$?; echo "$out" | tee log`，或 `out=$(cmd); rc=$?`。实证：CVE-2021-40391 第147条专门标注 `crash PoC (correct exit code capture)` 用 `rc=$?`。
+    **④ 重复多次确认可复现**：`for i in 1 2 3; do rm -f <产物>; <跑>; done`（并配合"跑前清痕"）。
+    **⑤ 产物落盘规范**：`mkdir -p <CVE>/{poc,exploit,evidence,lab}`；关键输出一律 `| tee evidence/xxx.txt`；结论文件首行必须命中判词串（可自检 `grep -m1 "可利用" README.md`）；权威数据（NVD/CVE/KEV JSON）原样存档。
+    **⑥ 证据脱敏**：落盘时对密钥类字段做 `sed -E 's/=.*/=<REDACTED>/'`，并在文档注明"transcript 已脱敏、原文件在盘"。
+  criteria: 成立=结论引用的每个"成功"都能指向一个磁盘文件或一条可重放的命令输出，且至少有一次**独立于执行者**的复核；退出码取自目标进程而非管道。失效=用管道后的 `$?` 判定崩溃；只看脚本自报的成功标记；或没有一次独立复核。
+  tags: whitebox, evidence-anchor, independent-verification, exit-code-trap, tee-pitfall, reproducibility, artifact-layout, redaction, 判据锚点, 独立复核, 退出码陷阱, 可复现, 产物落盘, 脱敏
+  reviewer: j0hnexp
+
+- title: 环境能力前置探测——先测"能做什么"再选证明路径
+  kind: sop
+  domain: binary
+  provenance: user
+  applicability: 开题阶段（前 5 条命令内应做完）——尤其是容器逃逸 / 内核 / mount 依赖类任务，不先测就会撞墙。前置：无。关键词：环境探测 / capability probe / capsh / seccomp / CAP_SYS_ADMIN / unshare / loop device / 开题四连 / 证明路径选择 / 兄弟任务目录。
+  content: |
+    **开题四连**（几乎每个成熟任务前 5 条内出现）：
+    ```
+    uname -a; cat /etc/os-release; id; ls -la /workspace
+    cat /workspace/task.md
+    for t in gcc gdb file checksec strace ltrace afl-fuzz pwntools ...; do command -v $t || echo MISSING; done
+    curl -sSI https://nvd.nist.gov          # 联网可达性（egress 白名单会决定能否拉权威数据）
+    ```
+    **能力指纹**（决定哪些题在本环境注定做不到）：
+    ```
+    capsh --print                     # 或 grep Cap /proc/self/status
+    unshare --user --map-root-user --mount sh -c true
+    unshare --mount --fork true
+    sysctl kernel.unprivileged_userns_clone
+    losetup -f ; ls -la /dev/loop-control /dev/fuse /dev/kvm /var/run/docker.sock
+    ```
+    实测常见指纹（多题命中同一枚）：`CapEff=0xa80425fb`（缺 CAP_SYS_ADMIN bit21、SYS_PTRACE bit19）+ seccomp 拦 `mount/umount2/unshare(含 CLONE_NEWUSER)/pivot_root/setns`（全 EPERM，仅 `chroot/setuid` 放行）+ 无 loop 设备 / 无 docker.sock / 无 `/dev/fuse` / 无 `/dev/kvm`。
+    **先看兄弟任务目录**：`ls -la /workspace/CVE-*`、`head -80 /workspace/<别的CVE>/README.md` —— 抄产物格式、复用已写好的工具、避免重踩同一枚能力坑。
+    **作用**：先测"能做什么"，再选走**字面复现 / verbatim 库级 PoC / surrogate / 只给阻塞报告**哪条路。**这是决策前置，不是事后解释**。
+  criteria: 成立=开题记录里有环境能力的**实测输出**（不是假设），且后续选路与该实测一致；能提前说出"这类题在本环境走哪条路"。失效=先埋头复现、撞墙后才发现缺能力；或把"环境不允许"当结论而不给能力实测。
+  tags: binary, capability-probe, environment-recon, capsh, cap-sys-admin, seccomp, unshare, loop-device, probe-first, sibling-task-dir, 环境探测, 环境能力探测, 能力指纹, 开题四连, 证明路径选择, 兄弟任务
+  reviewer: j0hnexp

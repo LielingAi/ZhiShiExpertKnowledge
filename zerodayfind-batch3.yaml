@@ -1,0 +1,96 @@
+# ZhiShi 专家知识导入 — 路由 / 语义审计 / 深挖编排（第三批）
+# 用法：zhishi expert import egym-set/expert/zerodayfind-batch3.yaml --reviewer j0hnexp
+# 来源：E:\code\kimiSec\zerodayFind（huntzero / kimiSec）——
+#   new/skills/cerebrum/references/domain-routing.md（13 领域关键词库 + 强制路由顺序）、
+#   new/skills/cerebrum/references/deep-dive-loop.md（四阶段深挖状态机 + 终止条件 + 状态 schema）、
+#   skills/security-expert/SKILL.md（暴露面→领域对照）、
+#   当我们用AI挖到第一个高危——假设驱动认知审计实战.md（H-1 条件编译语义背离）
+# 注意：导入不去重，同一文件只导一次；重复了用 zhishi expert rm 清理。
+#
+# 【检索纪律】search 只返回 ≤5 条，稳定命中的是 title / applicability / tags；
+#   中文长复合词常捞不出来。故关键词在 title + applicability + tags 三处重复，tags 中英双给。
+
+- title: 按暴露面路由领域——不看编程语言看暴露面
+  kind: sop
+  domain: whitebox
+  provenance: user
+  applicability: 拿到一个未知目标、决定加载哪套审计 playbook 时——这是白盒审计的**起手式**。前置：能读项目的文档 / 包管理 / 配置文件。关键词：领域路由 / domain routing / 暴露面 / 架构指纹 / 侦察 / recon / 领域情报 / 起手式。
+  content: |
+    强制四步（顺序不可换）：
+    **①先理解项目**——读 README、包管理文件（`package.json` / `go.mod` / `Cargo.toml` / `pyproject.toml`）、`Dockerfile`、`requirements.txt`、`*.md`，产出项目概况与技术栈情报。
+    **②对照关键词库判定**——任一关键词**以独立单词出现**即命中该领域（用 `\bkeyword\b` 全词匹配，避免子串误匹配，如 `rag` 不能匹配 `storage` 里的 `ra`）。可命中多个领域。
+    **③兜底**——一个都没命中时用 `foundation-lib`。
+    **④加载**——加载所有命中领域的地形情报，合并构建分析管线。
+    关键原则：**基于语义理解判定，而非文件名猜测**——"这个库是给 Web 框架用的"比文件层看到 `.js` 更准确。**看暴露面，不看语法**：Go 写的可以是 Web API 也可以是命令行工具；C++ 可以是 Web 服务器也可以是浏览器引擎。**领域是路由不是约束**——命中决定优先加载哪套 playbook，不阻止在分析中发现其他领域的问题。
+    暴露面 → 领域对照：HTTP/HTTPS API、Web 界面、REST/GraphQL → `web`；含浏览器引擎代码（V8/WebKit/DOM）→ `browser`；编译好的 ELF/PE、固件 → `binary`；邮件协议栈（SMTP/IMAP/MIME）→ `mail`；客户端工具、安全扫描器 → `counter`；LLM/Agent 框架、MCP Server、Skill/Plugin → `ai-agent`；包管理器、构建管道、发布流水线 → `supply-chain`；KV / SQL / LSM-Tree → `storage-engine`；JSON/XML/Protobuf/图片格式解析 → `data-parser`；Electron/Tauri/CEF → `desktop`；K8s Operator/Helm/Terraform/CI-CD → `infra`；通用工具库、数据结构库 → `foundation-lib`。
+    安全历史上下文（高价值起点）：grep 目标代码中 `security` / `cve` / `fix` / `vuln` 的提交注释与代码注释——**这些痕迹往往是开发者自己标注的高风险区域**。
+    判定输出（第一份状态输出）：项目情报摘要 + 命中领域（含命中哪个关键词、引用情报原文）+ 分析管线。
+  criteria: 成立=输出「项目情报摘要 + 命中领域（含命中依据）+ 分析管线」，且依据来自语义情报而非文件扩展名。失效=按语言后缀选领域（`.go` 就当后端、`.cpp` 就当二进制）；或只命中单一领域而未检查多领域并存。
+  tags: whitebox, domain-routing, attack-surface, architecture-fingerprint, recon, full-word-match, multi-domain, 领域路由, 暴露面, 架构指纹, 侦察, 起手式, 多领域
+  reviewer: j0hnexp
+
+- title: 白盒审计的九阶段分析管线
+  kind: sop
+  domain: whitebox
+  provenance: user
+  applicability: 需要给白盒审计定一条"不乱跳"的主线时；多 agent 分工时确定分工边界。前置：已完成领域路由（见「按暴露面路由领域」条）。关键词：分析管线 / pipeline / 阶段划分 / target-definer / vuln-hunter / variant-analyzer / validator / report-generator / 生成验证分离。
+  content: |
+    九阶段固定顺序（照序推进，不跳步）：
+    `target-definer → code-understander → vuln-hunter → hypothesis-tester → variant-analyzer → validator → exploit-builder → poc-generator → report-generator`
+    各阶段职责：
+    · **target-definer**——界定目标与范围，产出攻击面清单。
+    · **code-understander**——建代码心智模型（信任边界、数据流、不变量、隐式契约）。
+    · **vuln-hunter**——生成候选漏洞/假设，**不判真伪**。
+    · **hypothesis-tester**——验证或证伪假设，更新置信度。
+    · **variant-analyzer**——同源变体挖掘（在**已确认**漏洞周围找系统性模式）。
+    · **validator**——定损与可利用性评估（见「二进制漏洞五维度定损」条）。
+    · **exploit-builder**——构建利用链（见「崩溃到代码执行」条）。
+    · **poc-generator**——最小可复现 PoC（见「六段式证明链」条）。
+    · **report-generator**——产出报告，含全部 finding（含 exploit/PoC 状态）、变体、**被证伪的假设**与深挖轨迹。
+    三个设计要点：①**生成与验证分离**——vuln-hunter 只生成、hypothesis-tester 只验证，避免自我背书；②**变体放在验证之后**——先确认一个真洞，再沿它找系统性同源，命中率远高于凭空扫；③**被证伪的假设也要进报告**——负面知识同样是资产。
+  criteria: 成立=能说出当前处于哪个阶段、下一阶段的输入是什么；且生成与验证由不同阶段承担。失效=跳步（未建模型就生成假设、未确认漏洞就挖变体）；或把生成与验证混在一步里自我背书。
+  tags: whitebox, pipeline, staged-analysis, target-definer, vuln-hunter, variant-analyzer, validator, report-generator, separation-of-concerns, 分析管线, 阶段划分, 生成验证分离, 变体挖掘, 报告
+  reviewer: j0hnexp
+
+- title: 条件编译导致的安全语义不一致——查"承诺与实现是否一致"
+  kind: idea
+  domain: whitebox
+  provenance: user
+  applicability: 目标含多平台分支（`#if`/`#ifdef`/平台抽象层）时；或函数带契约注解（SAL `_Out_writes_*`、"最多写入 N 字节"式 doc comment）时。前置：能读到条件编译分支与函数声明。关键词：条件编译 / conditional compilation / 平台分支 / SAL 注解 / 契约违背 / 语义不一致 / memcpy_s / 跨分支语义。
+  content: |
+    命题：这类漏洞的本质**不是"用了 memcpy"**，而是**平台条件编译导致的安全语义不一致**。
+    典型形态：
+    ```c
+    #if PLATFORM_IS_MICROSOFT
+        memcpy_s(buffer, bufferSize, source, sourceSize);
+    #else
+        memcpy(buffer, source, sourceSize);   // bufferSize 被完全忽略
+    #endif
+    ```
+    调用方传入 1KB 栈缓冲、服务端返回 64KB → 多出的 63KB 覆盖返回地址 → RCE。
+    **SAST 为什么漏**：分析器在 Windows 上跑只看到 `memcpy_s` 判安全；在 Linux 上跑看到 `memcpy` 会告警，但告警只停在"建议用更安全的函数"，**不会指出参数契约被违背**这个更深层的问题。
+    更隐蔽的一层是**契约注解与实现的语义背离**：函数声明带 `_Out_writes_bytes_to_opt_(bufferSize, *bufferUsed)` 这类 SAL 注解，向编译器、静态分析工具和人类读者**共同承诺**"最多向 buffer 写入 bufferSize 字节"，而 `#else` 分支违背了这个承诺。传统 SAST 要么不解析注解，要么在条件编译面前**丢失跨分支的语义关联**。
+    方法论价值：**不依赖"危险函数签名"，而是追问"函数的承诺与实现是否一致"**——语义层审计，不是语法层扫描。可迁移到任何契约载体：SAL / doc comment / `assert` / 接口文档承诺 / 类型系统承诺 vs 运行期实现的偏离。
+  criteria: 成立=能指出某分支违背了函数声明的契约（注解/文档/类型承诺），并给出违反该契约的输入。失效=只按危险函数签名扫（见 `memcpy` 就报、见 `memcpy_s` 就放）；或没检查同一函数在不同条件编译分支下的语义是否一致。
+  tags: whitebox, conditional-compilation, platform-branch, sal-annotation, contract-violation, semantic-inconsistency, memcpy-s, cross-branch-semantics, 条件编译, 平台分支, 契约违背, 语义不一致, 注解背离
+  reviewer: j0hnexp
+
+- title: 结果驱动深挖循环——四阶段状态机与终止条件
+  kind: sop
+  domain: whitebox
+  provenance: user
+  applicability: 无人值守 / 多轮自动审计中，发现高置信漏洞后如何不停止、继续榨干；或需要给"什么时候该停"定硬规则时。前置：有可持久化的状态文件与跨会话续跑能力。关键词：深挖 / deep dive / 状态机 / 无人值守 / 变体挖掘 / 终止条件 / 停滞 / budget / 审计轨迹。
+  content: |
+    目标：发现高置信漏洞后**不停止**，自动进入深挖（exploit → PoC → variant），直到榨干或触发终止条件。每次唤醒是独立会话，靠 `audit/state.json` 跨会话续跑。
+    启动协议：先收两个参数（**缺一不可、不设默认值**）——**目标**（仓库 URL 或路径）与**间隔/深挖预算**（最大轮数或最大时长）。预算既是深挖强度，也是防无限烧钱的硬上限。
+    四阶段状态机（每轮评估输出后分派）：
+    · **EXPLOIT**（触发：finding confidence ≥ 0.80 且 `deep_dive.exploited` 不含它）——构建利用链 → 用 AST 级调用图/数据流确认真实代码路径 → 验证"不可信源 → 危险汇点"是否真连通 → 成功则标记并进 PoC；失败（critic 推翻）则下调置信度、标记废弃。
+    · **POC**（触发：漏洞已确认且未 `poc_done`）——生成最小可复现 PoC → 在预授权范围内执行验证 → 记录触发条件 / 复现命令 / 输出 → 成功则标记。
+    · **VARIANT**（触发：漏洞已榨干 exploit+poc）——问"同源漏洞在代码库其他位置是否系统性存在"（相同模式 / 函数族 / 配置）→ 找到的变体作为新 hypothesis 进入下一轮；无变体则标记 mined。
+    · **卡验证的 hypothesis**（confidence > 0.60 且仍 active）——用最小方案验证或证伪并更新置信度；多次失败（< 0.15）则丢弃。
+    终止条件（精确判定，四选一）：**榨干**=所有 finding 都在 exploited + poc_done + variants_mined；**停滞**=`stagnant_rounds ≥ 3`（本轮无新 finding / 新假设 / 深挖推进）；**轮次上限**=`total_rounds ≥ 20`（可配置）；**预算上限**=达会话 token / 时间预算。停滞计数规则：本轮有任一推进则归零，否则 +1。
+    状态文件（`audit/state.json`）必含：`hypotheses[]`（id / claim / target / confidence / status / rounds_spent）、`findings[]`（id / title / severity / confidence / evidence / status）、`deep_dive{exploited, poc_done, variants_mined}`、`progress{stagnant_rounds, total_rounds}`。读写规则：唤醒时存在则恢复，每轮结束写回，报告生成后置 `phase=done` 但**状态文件保留作为审计轨迹**。
+    边界：预授权仅限目标系统内的验证；禁止破坏性操作（`rm -rf`、格式化、打目标之外的系统）；**PoC 执行失败 ≠ 漏洞不存在**——记录失败原因、保留 finding、交人工复核。
+  criteria: 成立=四阶段各有触发条件与推进判据，终止条件可精确判定（四选一），状态文件能支撑跨会话续跑。失效=发现漏洞就停；没有终止条件（无限轮）；或状态不落盘（会话一断就从头来）。
+  tags: whitebox, deep-dive, state-machine, autonomous-audit, variant-mining, termination-condition, stagnation, budget, audit-trail, 深挖, 状态机, 无人值守, 变体挖掘, 终止条件, 停滞, 审计轨迹
+  reviewer: j0hnexp
