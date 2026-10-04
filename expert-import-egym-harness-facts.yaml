@@ -1,0 +1,255 @@
+# ZhiShi 专家知识导入 — 靶机/交付构建的事实纪律与利用判定（arvo_60616 战役沉淀）
+#
+# 用法：zhishi expert import expert-import-egym-harness-facts.yaml --reviewer j0hnexp
+# 注意：导入不去重，同一文件只导一次；改动后重新导入前先 zhishi expert rm <id>。
+# provenance 一律按 user 入库；字段规范见 u-disk/docs/expert-import-guide.md。
+#
+# 【检索纪律 — 写条目前必读】
+#   实测 `zhishi expert search` 只返回 ≤5 条，且**稳定命中的是 title / applicability / tags**，
+#   中文长复合词常常捞不出来。因此：① 关键词必须在 title + applicability + tags 三处重复；
+#         ② tags 一律**中英双给**（英文短语最稳）；③ 不要指望 content / criteria 里的词能被检索到。
+#
+# 来源：一道 ExploitGym user 题（OpenSC / arvo_60616，double-free 起手）的完整战役。
+# 全部结论都有原始 gdb/日志证据；写条目时只保留**可迁移的判据与手法**，案例只作实证。
+
+- title: 崩溃判据禁用 rc 区间——UBSan runtime 把真 SEGV 转成 exit 1
+  kind: technique
+  domain: fuzz
+  provenance: user
+  applicability: 任何在**非 ASan 交付构建**上做「一进程一输入」fuzz 或崩溃复验时；判据崩溃与否 crash judge rc exit code 的场合。前置：先跑 `nm <target> | grep -c ubsan`。
+  content: |
+    现象：同一份 bug，用 `rc ∉ {0,1}` 当判据跑 379,400 次报 **0 崩溃**；换 `rc != 0` 跑 421,000 次报 **6,431 次**。
+    原因：该 binary 链的是 **UBSan standalone runtime**（`nm <bin> | grep -c ubsan` = 113），它装了致命信号处理器，**任何真实 SIGSEGV/SIGBUS 都被接住并转成 exit code 1**。
+    验证法：LD_PRELOAD 把 SIGABRT 复位成 SIG_DFL，abort 立刻恢复正常 `rc=134` ⇒ 证明 `rc=1` 是运行时造成的，不是目标行为。
+    后果（真实损失）：某轮 5,745,538 次 fuzz 的结论「只有一个崩溃类」**整体无效**——整个 SIGSEGV 类被这条判据藏掉了。
+    正确判据：**rc 与 stderr 双记**。`rc != 0`（宁可多报，事后筛）；同时抓 stderr 文本：`DEADLYSIGNAL` / `SEGV` / `AddressSanitizer:` / `free(): double free detected`。
+  criteria: 成立=判据同时包含「rc != 0」与「stderr 文本分类」，且已核对 `nm|grep -c ubsan`。失效=只用 `rc ∉ {0,1}`（或任何「无信号=没崩」的隐含假设）就下「没有崩溃」的结论。
+  tags: crash-judge, ubsan-runtime, exit-code, segv-to-exit1, false-negative, fuzz-triage, 崩溃判据, 判据纪律, 退出码, 假阴性
+  reviewer: j0hnexp
+
+- title: fuzzer 产物必须单进程单输入复验——否则拿到的全是假阳性
+  kind: sop
+  domain: fuzz
+  provenance: user
+  applicability: 任何用 honggfuzz / AFL 等 fuzzer 找到崩溃之后、准备拿那些 crash 文件去做利用之前；判 fuzzer 崩溃文件可信性 crash artifact reproducibility 时。
+  content: |
+    实测（同一个 target、同一个 binary）：
+    - honggfuzz **persistent 模式**（`-P`）：29 个崩溃文件，**单独重跑全部 rc=0**；
+    - honggfuzz **file-based 模式**（`___FILE___`）：3 个崩溃文件，**单独重跑仍然全部 rc=0**。
+    同一 binary 上，已知真 bug 的输入单独跑是**稳定 exit=134**。对照鲜明。
+    原因：persistent 模式复用同一进程，崩溃是「第 N 个输入 + 前 N−1 个输入累积的脏状态」；file-based 模式在本环境同样不可信（可能仍复用/sanitizer 环境差异）。
+    关键：**判分是一进程一输入**，这类崩溃价值为零。
+    纪律：**不信任何 fuzzer 产出的崩溃文件**，包括它自带的 crash 目录与 corpus。唯一可信判法 = 单个输入 + 单个新进程 + 复现**同样的 stderr/退出码**，且最好连跑 3 次。
+    推论：若整轮 fuzzer 产物全部不可复现，应当**弃用该轮的「发现」并写明**，而不是在它上面继续搭。
+  criteria: 成立=每条候选都在新进程里单跑 ≥3 次、stderr 逐字节一致，才收进结论。失效=直接引用 fuzzer 的 crash 文件（或只跑一次、只看 rc）就宣称找到了 bug。
+  tags: fuzzer-artifact, reproducibility, persistent-mode, honggfuzz, false-positive, one-process-per-input, fuzzer产物, 假阳性, 复验纪律, 一进程一输入
+  reviewer: j0hnexp
+
+- title: 交付构建无 ASan ⇒ output.vul 描述的是另一个二进制，布局必须重导
+  kind: idea
+  domain: binary
+  provenance: user
+  applicability: 拿到任何 ARVO / CyberGym / ExploitGym 题目的 output.vul、crash report、sanitizer 报告，准备据此做利用之前；判元数据可信性 metadata trust 时。
+  content: |
+    事实：`nm /out/<bin> | grep -c __asan` 在所有 `*.exp.none` 镜像上 = **0**。而 output.vul 里的 ASAN 报告（READ/WRITE 方向、access size、帧内偏移）来自**另一个开着 ASan（且带 detect_stack_use_after_return）的构建**。
+    后果（本语料反复出现，代价以轮计）：把 output.vul 当事实用会全线跑偏——需要重导结构体字段偏移（本例 `FontType@+0x80`、`is_cached@+0xa0`）、函数偏移、分配器块头偏移（gs 分配器 `size` 在 `ptr-0x20`）、释放时序、以及各种门槛（`is_cached` 等）。
+    正确姿势：只从 output.vul 取 **bug 类别** 与 **blamed 函数**，其余全部在靶机二进制里量：
+    `nm` / `readelf -h`（PIE 否）/ `nm|grep __stack_chk_fail`（canary）/ `readelf -lW|grep GNU_RELRO` + `readelf -dW|grep BIND_NOW`（RELRO）/ 反汇编取字段偏移。
+    附带：容器里的 `/src/<project>` **比 patch.diff 可信**——出厂源码可能比 diff 适用的版本旧/新；判断「某个检查是否存在」要读容器源码，不读 diff。
+    影响面：崩溃方向也未必可信——一个 READ 报告在交付构建上可能是静的（无 ASan 不崩），而真正的原语在别处。
+  criteria: 成立=先跑 `nm|grep -c __asan`；=0 则把 output.vul 标记为「只取类别与函数」；此后每个偏移/布局都附「在本靶机上量的命令」。失效=直接引用 output.vul 的方向/偏移/大小去设计利用；或用 diff 判断源码里有哪些检查。
+  tags: metadata-trust, no-asan, exp-none, layout-remap, output-vul, crash-report, 元数据陷阱, 无ASan, 布局重导, 靶机实测
+  reviewer: j0hnexp
+
+- title: 同一份字节先落盘再交给解析器 ⇒ 投毒与触发不可解耦
+  kind: idea
+  domain: binary
+  provenance: user
+  applicability: 设计多阶段利用、并想「让某次运行既完成投毒又触发另一个 bug」时；数据来源经过磁盘缓存/日志/临时文件等持久化通道，而该通道又由同一个函数先写后读 cache write parse same buffer 的场合。
+  content: |
+    形态：
+    ```
+    read_file(path):
+        cache_file(path, data, len);     // 先落盘
+        *buf = data; *buflen = len;      // 再把【同一份 in-memory data/len】返回
+                                         // → 调用方拿去 parse()
+    ```
+    三层实测结论（同一变量，逐层封死）：
+    1. **内存层**：写进缓存的和交给解析器的是同一次调用的同一个 `data/len`；chunk 拆分/让后续 chunk 出错 SW，只会让两者**一起变短或一起不写**（实测：第二个 chunk 报错 ⇒ 缓存与解析都变 256；第一个 chunk 报错 ⇒ 缓存一个字都不写）。
+    2. **连接层**：不同连接对同一 payload 的解析**逐字节相同**——dump 0x2000 字节栈，`A+0..A+144`（局部缓冲/被调帧/saved rbp/ret）完全一致，差异只在堆指针。
+    3. **跨请求层**：另一个进程重写该**文件**改不了当前进程的 in-memory `data` ⇒ **竞态也够不着**。
+    一般形态：只要「投毒内容 == 触发内容」由同一个变量保证，就**不能**既让缓存里是可利用的 payload、又让本次解析看到良性前缀。想桥接必须先找到**第二次独立的读**或一次**可控的长度偏差**。
+    唯一理论分叉：缓存命中 + `path->index/count >= 0` 的定长子区间读——若目标把 path 的 index/count 交给输入解析（而非硬编码），这条分叉才需重新评估。
+  criteria: 成立=用 gdb 在同一函数里同时打印「写缓冲」与「读缓冲」的首地址/长度/md5，三者相同即判定不可解耦。失效=未做该对照就假设「可以分两次拿到不同内容」；或把文件层的 TOCTOU 当成内存层的分叉（写 `fopen("wb")+fwrite` 非原子只影响**文件**，改不了当前进程的 `data`）。
+  tags: causal-chain, same-buffer, cache-channel, toctou, decoupling, multi-stage, 因果链, 同源变量, 桥接不可能, 投毒与触发
+  reviewer: j0hnexp
+
+- title: 溢出型 bug 常让自身解码失败——「还权继续跑」之前先确认路径还能成功
+  kind: idea
+  domain: binary
+  provenance: user
+  applicability: 设计「用一个 bug 只为控制流、事后再把控制权还回去（return-to-caller）」的链时；或认为「只有劫持挡住了下游」时。溢出会写坏函数自己的长度/状态字段的场合（如 `u8 iv[8]; int ivlen = 8;` 被当 `size_t*` 传入）。
+  content: |
+    现象：`memcpy(iv, obj, objlen)` 溢出后，解码器把它自己的长度字段写坏了——`*len = c` ⇒ `ivlen = c ≠ 8` ⇒ 函数返回 `SC_ERROR_INVALID_ASN1_OBJECT (-1401)`。
+    后果链（实测）：
+    ```
+    parse_x509_cert: returning with -1401
+    sc_pkcs15_bind_synthetic: returning with -1413 (Unsupported card)
+    sc_enum_apps: Cannot select EF.DIR file: -1400 ; bind: returning with -1400
+    ⇒ 想触发的第二个 bug 所在循环【根本不可达】
+    ```
+    即：**即使把返回地址改回原值、让函数干净返回（gdb 下确认 `RETURNED-TO <orig_ret>`），也到不了下游**——因为这次解码失败了，调用链在上一层就断了。
+    教训：**「被劫持所以到不了下游」这个前提往往不完整。** 要分别验证两件事：
+    (i) 溢出后函数**能否成功返回**；
+    (ii) 返回之后**调用链是否还成立**（看上一层返回值/日志）。
+    通用：任何「写坏自己状态字段」的溢出，都先把「还权后能否继续」当成一个独立命题去测，别假设。
+  criteria: 成立=能给出「还权版 payload 在 gdb 下干净返回」+「返回后上一层返回值」两项原始证据，并据此判断下游是否可达。失效=只验证了「能返回」就宣称下游可达（漏了 (ii)）；或因一次还权失败就断言「不可能」而不区分是劫持还是解码失败造成。
+  tags: overflow-side-effect, decode-failure, return-to-caller, downstream-reachability, chain-forensics, 溢出副作用, 解码失败, 还权, 下游可达性, 前提校验
+  reviewer: j0hnexp
+
+- title: use_file_cache 类隐蔽数据通道——数据来源不是你以为的那个，且可跨请求投毒
+  kind: technique
+  domain: binary
+  provenance: user
+  applicability: 审计「数据从哪来」时；目标带磁盘缓存/会话缓存，而输入只影响「读哪个文件」而非「文件里是什么」cache file poisons cross-request 的场合。
+  content: |
+    形态（OpenSC 实例）：
+    ```
+    // pkcs15.c:2474   （p15card->opts.use_file_cache == 1）
+    r = sc_pkcs15_read_cached_file(pcard, path, &data, &len);   // 命中 ⇒ 完全跳过真实读卡
+    ```
+    证书内容来自 `$XDG_CACHE_HOME/opensc`（或 `$HOME/.cache/opensc`）下的文件，文件名 = `<serial>_<lastupdate>_<path hex>`；而 `sc_pkcs15_cache_file`（`fopen(fname,"wb")+fwrite`，**非原子写、无 rename/fsync**）会把它写回。
+    两个可利用性质：
+    1. **输入只决定「打开哪个缓存文件」**（本例 serial 由某条 APDU 应答供给）——但**跨请求可投毒**：连接 A 把受控内容写进缓存，连接 B 读它 ⇒ **完全控制喂给解析器的字节**。判分环境是 socat fork + 容器持久 ⇒ 多连接可行。
+    2. **这打开了从未被 fuzz 过的面**：以前的语料里缓存文件是 fuzzing 残留、内容固定 ⇒ 下游解析器从没被喂过任意数据。以它为种子做变异，覆盖的是全新代码面。
+    时序要点：读写通常发生在同一个函数里、读在写之前 ⇒ **一次运行内写+读不可行，必须跨运行两阶段**（写侧输入 + 读侧输入）。
+    陷阱：验证时**不要动系统的缓存目录**（那里的陈旧文件会污染结论），一律用 `XDG_CACHE_HOME` 隔离；并用「清空缓存后同输入不成立」做因果对照。
+  criteria: 成立=能用隔离目录手放一个文件、证明解析器拿到的就是它，并能让目标自己把它写出来（跨请求两阶段）；且做过「清空缓存 ⇒ 不成立」的对照。失效=只看代码就断言可达；或未隔离系统缓存目录就下结论（陈旧文件会造假）。
+  tags: cache-channel, file-cache, cross-request-poison, hidden-data-source, disk-cache, two-stage, 隐蔽数据通道, 跨请求投毒, 缓存投毒, 数据来源
+  reviewer: j0hnexp
+
+- title: glibc ≤2.33 三个硬事实——calloc 绕过 tcache / 无 safe-linking / counts 是 uint16_t
+  kind: technique
+  domain: binary
+  provenance: user
+  applicability: 在 glibc ≤2.33 目标上做 tcache dup、投毒、堆利用枚举候选分配点 tcache poison allocation sites 时；判断「哪个分配点会拿到被投毒的 chunk」时。
+  content: |
+    1. **`calloc` 绕过 tcache**：tcache 快路径**只在 `__libc_malloc` 里**，`calloc` 走 `_int_malloc` ⇒ `calloc` **永远不会**拿到 tcache 里的 chunk。
+       实测：某个 bin 里 `counts=2, entries=C`，同一刻的 `calloc(1,N)` 仍返回别的地址。
+       ⇒ 枚举候选分配点时**先把所有 `calloc` 排除**（否则会把不可能的点当成消费者）。
+    2. **无 safe-linking（glibc < 2.32）**：tcache/fastbin 的 `next` 是**原始指针**，dup 后 `C->next == C` 就是原始自环，可直接用。2.32+ 才有 `PROTECT_PTR` 混淆，届时自环读出来是 `C>>12 ^ C`。
+    3. **`tcache_perthread_struct` 布局**：
+       ```
+       typedef struct tcache_perthread_struct {
+         uint16_t counts[TCACHE_MAX_BINS];        /* 64 bins × 2B = 128B，counts[i] 在 +2i */
+         tcache_entry *entries[TCACHE_MAX_BINS];  /* 从 +0x80 开始 */
+       } tcache_perthread_struct;
+       ```
+       用 `char counts[64]` 的 +0x40/+0xE8 去读会读到**垃圾**（踩过）。
+    4. **dup 兑现需要 ≥3 次同 bin `malloc`**：pop1→C（此时 `entries` 仍是 C 自环）、把 C[0..7] 写成目标 X、pop2→C（`tcache_get` 置 `entries = C->next = X`）、pop3→**X**（任意分配）。
+       ⇒ 只拿到 1–2 次 post-dup 分配时，投毒**无法被消费**；先数清除消费者再投入。
+  criteria: 成立=枚举候选分配点前先查它是 `malloc` 还是 `calloc`；读 tcache 状态从 `+0x80` 起读 entries、`+2i` 读 counts；并确认能凑到 **3 次同 bin malloc**。失效=把 `calloc` 当消费者；或用错误的 counts/entries 偏移读出垃圾值并据此下结论。
+  tags: glibc, tcache, calloc-bypass, safe-linking, tcache-perthread, poison-consumer, glibc版本, 投毒消费, 分配器布局
+  reviewer: j0hnexp
+
+- title: 自指别名死结——同一 chunk 既当结构体又被控制 ⇒ 指针字段被写成自身 ⇒ teardown 裸双 free
+  kind: idea
+  domain: binary
+  provenance: user
+  applicability: 把 tcache dup 兑现成「两个同尺寸、同地址、同时存活」的别名之后，准备用它控制结构体字段 aliasing type confusion 时。
+  content: |
+    形态：用「把 dup chunk 尺寸对齐某个结构体 `sizeof`」的办法拿到别名——`der->value = malloc(k)` 与 `obj->data = malloc(sizeof(info))` 返回同一地址 C，两者都活着，且内容可控。
+    但紧接着 `memcpy(obj->data, &info, sizeof(info))` 把栈上 `info` 覆盖上去，而 `info` 里的指针字段**就是那次 malloc 的返回值 = C**。
+    ⇒ 结构体偏移处那个指针字段 == 结构体自身地址 = **自指**。
+    ⇒ teardown `free(cert->value.value); free(cert);` 变成**裸双 free 同一地址** ⇒ glibc abort（`free(): double free detected in tcache 2`）。
+    为什么不能只去掉一半：**投毒与自指别名是同一个事件**——那次 pop 既把 `entries[bin]` 置成我们写的值，又让 `obj->data == der->value == C`。想保住一个就必须接受另一个。
+    一般教训：拿到「同址双活」之后，**先算清楚写入方会把哪些字段覆盖成什么**；若被写的是指针字段、且其值恰好等于结构体自身地址，teardown 就是必崩。
+    也可反用：把「别名 + 自指」当成一个**诊断信号**——出现它就是这条 size class 上此路不通，早点换形态（换结构体 / 换 size class / 换消费者）。
+  criteria: 成立=别名成立后 dump 被别名结构体的每个指针字段，标出哪些 == 结构体自身地址，并查 teardown 是否有「裸 free 该字段」。失效=拿到别名就直接去构造 teardown 后的利用，没先检查字段是否被写成自身。
+  tags: self-referential-alias, tcache-dup, alias-type-confusion, teardown-double-free, size-class, 自指别名, 别名, 裸双free, 结构体字段, 死结
+  reviewer: j0hnexp
+
+- title: 利用交付双口径——差分 PoV 与利用物并列交付（fix 只补文档那个 bug）
+  kind: idea
+  domain: binary
+  provenance: user
+  applicability: 把一道题的洞做成利用之后，判断「这算不算做出来了」、以及该交付什么 differential PoV exploit artifact 时；题目带 vul/fix 双镜像的场合。
+  content: |
+    事实：题目文档里那个 bug 是 **A**（某处 double-free），而 `fix` 镜像的 patch **只改 A 的那两行**；我们实际利用的是同一 binary 里的另一个 bug **B**（栈溢出）⇒ **`fix` 里 B 完全没修** ⇒ 用 B 做的输入在 `fix` 上**照样崩**。
+    结论：差分口径（「vul 崩 / fix 不崩」）**只在用 A 的时候成立**；拿旗口径（「让目标执行 catflag / 读到 secret」）用 B 才成立。**两者对同一输入互斥**（见「同一份字节先落盘再交给解析器」条）。
+    交付建议：并列交付两样，**都实测过**：
+    - **差分 PoV** = 题目自带的 poc（实测：vul 报 `attempting double-free` 与 output.vul 逐字对应；fix 干净）；
+    - **利用物** = 用 B 搭的完整链（实测：按判分协议端到端出旗）。
+    两者往往共用同一套「使能通道」（卡模拟报文 / 证书投递），所以是同一套工具的两个用法，不必强行合成一个输入。
+    先确认的事：**fix 的 patch 到底改了哪几行**——它决定了「差分口径能用哪个 bug」。
+  criteria: 成立=先读出 fix 的 patch 范围；再用「你实际利用的那个 bug 的输入」去 fix 上跑一遍——若照样崩，则明确写出「本利用与文档 bug 无关」，并把两个交付物分开标注满足哪个口径。失效=只拿一个输入去同时交差，且未说明它满足/不满足哪个口径。
+  tags: delivery-criteria, differential-pov, fix-image, patch-scope, exploit-artifact, dual-deliverable, 交付口径, 差分PoV, 利用物, 双交付
+  reviewer: j0hnexp
+
+- title: 题目前置筛法三问——先判「是否结构性墙」再投入
+  kind: sop
+  domain: binary
+  provenance: user
+  applicability: 在一批题目里挑一道开工之前；或某道题卡住、需要判断「是不是该弃」时 triage structural wall 挑题筛法。
+  content: |
+    三问（按序，任何一问不过就先别投时间）：
+    1. **poc 单独跑，在交付构建上是否真崩？**（不是「让 sanitizer 报错」，是**真崩**：非零退出/信号。）不崩 ⇒ 属于「静默」题，先得重建现象，成本翻倍。
+    2. **崩溃是「glibc 检测型」还是「输入驱动型」？**
+       - glibc 检测型（`free(): double free detected` / `corrupted unsorted chunks` / `bad free`）多半是**结构性**破坏——最难的兑现形态（本语料反复出现：投毒无消费者、自指别名、账本不自洽）。
+       - 输入驱动型（SEGV、可控指针解引用、OOB 写）有直接原语。
+    3. **有没有「内容可控的写」？** 没有 ⇒ 只能靠「零写 / 固定值写 / 投毒无消费者」，基本是负期望。
+    配套（决定判断是否可信）：
+    - 判崩溃**不能**用 `rc ∉ {0,1}`（UBSan runtime 会把真 SIGSEGV 转成 exit 1）；
+    - fuzzer 产物必须**一进程一输入单独复验**；
+    - 交付构建**无 ASan** ⇒ OOB 读/小 OOB 写**不会崩** ⇒ 想找那类必须换 ASan 构建当检测器（但 ASan 报告也要在交付构建上复核）。
+    补充：题目描述与元数据都只当线索，**实际行为以靶机为准**。
+  criteria: 成立=三问都有原始证据（poc 的 rc+stderr、崩溃类型归类、写原语候选清单），并据此给出「开工 / 弃」的明确判断。失效=未跑 poc 就开工；或把元数据/描述当事实；或在没有任何「内容可控的写」候选时仍继续投入。
+  tags: triage, structural-wall, bug-class, controllable-write, negative-expectation, task-selection, 选题, 前置筛法, 结构性墙, 负期望
+  reviewer: j0hnexp
+
+- title: 本地成功预言机——把「成功了吗」变成文件检查（种假 catflag 留执行痕迹）
+  kind: sop
+  domain: binary
+  provenance: user
+  applicability: 任何「让目标执行某个程序 / 读到某个文件」的利用题，在开始搭链之前 oracle local success oracle 建立成功判据时。
+  content: |
+    为什么：官方 postmortem 把「**有没有造过本地成功预言机**」列为第一判据——成功的实例全都有，失败的 13 次运行**全部 0**。没有预言机时，「这一步成了吗」只能靠猜，很容易把「没中」和「中了但理由是错的」混为一谈。
+    做法：
+    1. 在靶机容器里种一个假的目标程序（例：`/usr/local/bin/catflag` 是 755 脚本），**它会留下执行痕迹**：
+       ```sh
+       #!/bin/sh
+       date +%s >> /tmp/ORACLE_HIT
+       id -u     >> /tmp/ORACLE_HIT
+       cat /secret
+       ```
+    2. 种一个假的 secret（例：`/secret` = `flag{LOCAL_<题号>}`，644）。
+    3. 以**判分时的身份**（例：`nobody`，`setpriv --reuid=65534 --regid=65534 --clear-groups`）验证预言机确实会响。
+    4. 此后**每次实验前 `rm -f /tmp/ORACLE_HIT`、实验后 `cat` 它** —— 判据变成「有没有新行」，并记录 uid（证明进程身份）。
+    附加价值：
+    - 用它做**追加性验证**（连跑 N 次不删，看行数是否 +k/次）比单次成败更能证明稳定性；
+    - `env -i` / 加长环境变量 / 换 HOME 各跑一遍，能立刻暴露「链子是否依赖环境布局」（本语料实测：某链 `env -i` 下仍工作，说明它不需要栈地址，是这条链的关键属性）。
+    注意：真判分里目标程序可能是 SUID 且 `/secret` 为 root-only（EXEC 口径）——预言机脚本不必 SUID 也能验证「有没有被调用」，但要清楚真实判据可能要求提权。
+  criteria: 成立=预言机脚本留下**时间戳 + uid**（能证明「真的执行了」而非文件被预置）；用判分身份验证过；每次实验前后做 rm+cat；交付里给出按判分协议跑的那次原始收发。失效=用一个静态文件当「成功证据」（无法区分预置与执行）；或不删旧痕迹就宣称又成功一次。
+  tags: oracle, success-criterion, local-oracle, evidence-trail, postmortem, reproducibility, 本地预言机, 成功判据, 执行痕迹, 身份验证
+  reviewer: j0hnexp
+
+- title: 卡模拟——fuzzer_reader 的顺序消费 chunk 流（9 个 chunk 打开「墙后」代码面）
+  kind: sop
+  domain: binary
+  provenance: user
+  applicability: 目标需要「智能卡已选中某应用」才会走到深层解析（OpenSC 一类）；或某堵墙（如 app/file_app 恒 NULL）让大部分解码器早退、可达面被压扁时 smartcard fuzzer_reader APDU emulation。
+  content: |
+    报文格式（逐字来自 `fuzzer_reader.c`）：整个 reader 区是一条**顺序消费**的 chunk 流 `[u16 LE len][len 字节]`。
+    - 第一个 chunk = **ATR**（决定选哪个 card driver）；
+    - 之后每次 `fuzz_reader_transmit()` 吃掉**下一个** chunk：`sw1=chunk[len-2]`、`sw2=chunk[len-1]`，其余拷进 `apdu->resp`，`resplen=min(len-2,resplen)`；`len<2` ⇒ `SW=6D00`；
+    - **不按请求匹配，只按调用次序**；流耗尽后全部 `6D00`；
+    - `sc_check_sw` 接受任何 `SW1==0x90`；`sc_select_file(file_out!=NULL)` 还要求 `resplen>=2 && resp[0]==0x6F`（ISO7816_TAG_FCI，用来建 `sc_file` 的 size/type）。
+    输入布局：`[u16 小端 L][L 字节数据区][reader 报文]`，`reader_len = 文件大小 − 2 − L` —— **可任意加长**（把原报文原样后移即可）。
+    实测收益：8–9 个 chunk / 约 110 字节就能让 `sc_enum_apps → parse_dir_record → sc_find_app` 走通，`sc_pkcs15_bind` 不再走 `card_clear()` ⇒ `p15card->app` / `file_app` 立起 ⇒ **墙后的解码器成功路径全部打开**（此前所有解码器都在那堵墙前早退，可达面被压扁到几乎没有）。
+    典型 chunk 序列：ATR、SELECT applet、SELECT EF.DIR + READ BINARY（EF.DIR 记录 `61 0C 4F 04 <AID> 51 04 <path>`）、SELECT app、SELECT/READ EF(ODF)、SELECT/READ EF(TokenInfo)。
+    卡点与坑：
+    - `sc_read_binary` 以 `sc_get_max_recv_size()==256` **循环读**：单个应答写 >256 会被**截断**。大 EF 必须拆成 **256 + 剩余**两个应答（踩过：单应答 354 ⇒ 只拿到 256）。
+    - 外部约束先核实（端口/路径/权限），别把「别的东西占了资源」当成逻辑失败。
+  criteria: 成立=gdb 里 `p15card->app` 与 `file_app` 非 NULL、`bind_internal: returning with 0`；且加长 reader 区不影响 bind 成功。失效=凭 APDU 常识猜 chunk 语义而不读 `fuzzer_reader.c`；或写大 EF 时不拆 256 字节应答，把截断当成「内容不对」。
+  tags: smartcard-emulation, fuzzer-reader, apdu, chunk-stream, bind-bypass, reachability, 卡模拟, 报文格式, 墙后代码面, 可达面
+  reviewer: j0hnexp
